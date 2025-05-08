@@ -343,6 +343,25 @@ class Environment:
             return False
         return True
 
+    # --- Snapshot and Restore State for Value Iteration and other analyses ---
+    def get_full_state(self):
+        """Returns a deep copy of the internal environment state."""
+        import copy
+        return {
+            't': self.t,
+            'robots': copy.deepcopy(self.robots),
+            'packages': copy.deepcopy(self.packages),
+            'total_reward': self.total_reward
+        }
+
+    def set_full_state(self, state_dict):
+        """Restores the internal environment state from a snapshot."""
+        import copy
+        self.t = state_dict['t']
+        self.robots = copy.deepcopy(state_dict['robots'])
+        self.packages = copy.deepcopy(state_dict['packages'])
+        self.total_reward = state_dict['total_reward']
+
     def render(self):
         """
         A simple text-based rendering of the map showing obstacles and robot positions.

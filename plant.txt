@@ -1,0 +1,96 @@
+Kế hoạch Triển khai Warm‑Start MARL với Value Iteration
+
+Mục tiêu: Sử dụng Value Iteration trên môi trường giao hàng đa robot để tính xấp xỉ hàm Q của GreedyAgent (heuristic BFS), sau đó khởi tạo và pre‑train MARL agent (ví dụ PPO/MAPPO) trên cơ sở Q  đã tính, nhằm đẩy nhanh quá trình học và cải tiến hiệu năng.
+
+1. Chuẩn bị và Khảo sát Môi trường
+
+Kiểm thử môi trường:
+
+tạo main_greedy.py với GreedyAgents để ghi lại các kết quả (reward, time steps) cho các bản đồ mẫu (map1..map5).
+
+Thu nhỏ không gian trạng thái:
+
+
+Xác định encoding trạng thái (s) dưới dạng tuple hoặc integer index (ví dụ flatten grid + packing robot positions + gói status hoặc có thể phức tạp hơn).
+
+Triển khai bộ Map và Action Set:
+
+Đánh số rời rạc toàn bộ hành động kết hợp (move, pkg_act) thành A={0,1,...,M-1}.
+
+Xây hàm xác định hàm chuyển P(s'|s,a) và R(s,a) thông qua env.step() trong môi trường thu nhỏ.
+
+2. Tính Value Iteration / Policy Iteration
+
+Cài đặt Value Iteration:
+
+Viết module solve_vi.py:
+
+# solve_vi.py
+from env import Environment
+def value_iteration(env, gamma, eps): ...
+
+Sử dụng policy iteration nếu cần (thử nghiệm).
+
+Xác định hội tụ:
+
+Đặt gamma , epsilon = 1e-4.
+
+Kiểm tra độ chênh Q delta mỗi vòng < epsilon.
+
+Xuất Q và Chính sách:
+
+Lưu dictionary { (s,a): Q(s,a) } và chính sách Greedy π_0(s)=argmax_a Q(s,a) vào file (pickle/hdf5).
+
+Viết script export_q.py để lưu ra q_values.pkl và policy_init.pkl.
+
+3. Pre‑training MARL agent với Q khởi điểm
+
+Chọn thuật toán MARL:
+
+Ví dụ: MAPPO (CTDE), hoặc PPO độc lập với parameter sharing.
+
+Xác định template code MARL (dựa trên SB3 hoặc PyTorch custom).
+
+Thiết kế network:
+
+Actor: nhận obs(s) → phân phối action (A rời rạc).
+
+Critic: nhận s, a → ước lượng Q_pred(s,a).
+
+Pre‑train Critic (MSE):
+
+Tạo DataLoader từ q_values.pkl.
+
+Loss: L = MSE(critic(s,a), Q_target).
+
+Chạy 100 epoch, lưu checkpoint critic.
+
+Pre‑train Actor (Supervised):
+
+Dataset (s, a_best) với a_best = argmax_a Q(s,a).
+
+Loss: L = CrossEntropy(actor_logits(s), a_best).
+
+Chạy 100 epoch, lưu checkpoint actor.
+
+4. Huấn luyện MARL bình thường (Fine‑tuning)
+
+Cấu hình huấn luyện:
+
+Sử dụng SB3-MAPPO hoặc thư viện khác, có thể tự code.
+
+Load weights khởi điểm từ pre‑train.
+
+Thiết lập gamma, learning_rate, batch_size, ppo_epochs.
+
+Thu thập trải nghiệm:
+
+Môi trường đa tác nhân: gọi env.step(actions).
+
+Tính advantage, update actor & critic on-policy.
+
+Giám sát và đánh giá:
+
+Theo dõi reward trung bình (episodic) trên các map khác.
+
+So sánh với Greedy baseline .

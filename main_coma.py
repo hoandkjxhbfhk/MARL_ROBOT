@@ -33,7 +33,7 @@ if __name__=="__main__":
                       n_robots=args.num_agents, n_packages=args.n_packages,
                       seed = args.seed)
     
-    agents = MADDPGAgents(lr_actor=1e-4, lr_critic=1e-3)  # For MADDPG
+    agents = COMAAgents(lr_actor=1e-4, lr_critic=1e-3)  # For COMA
     
     with open(args.log_file, 'w', newline='') as csvfile:
         log_writer = csv.writer(csvfile)

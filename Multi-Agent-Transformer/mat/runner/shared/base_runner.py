@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import torch
-from torch.utils.tensorboard import SummaryWriter
+from tensorboardX import SummaryWriter
 from mat.utils.shared_buffer import SharedReplayBuffer
 from mat.algorithms.mat.mat_trainer import MATTrainer as TrainAlgo
 from mat.algorithms.mat.algorithm.transformer_policy import TransformerPolicy as Policy

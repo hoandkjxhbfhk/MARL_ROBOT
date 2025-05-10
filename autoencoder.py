@@ -11,40 +11,55 @@ from tqdm import tqdm
 # ---- State Representation ----
 def state_to_vector(state, map_size=(10, 10), max_pkgs=10):
     """Chuyển trạng thái môi trường thành feature vector cố định cho Autoencoder."""
-    # Thông tin robot
+    # Thông tin robot: hỗ trợ cả tuple và object
     robot = state['robots'][0]
-    r, c = robot.position
+    if isinstance(robot, tuple):
+        r, c, carrying = robot
+        # env.get_state trả về vị trí 1-indexed
+        r0 = r - 1
+        c0 = c - 1
+    else:
+        r0, c0 = robot.position
     carrying = robot.carrying
 
     # Khởi tạo vector đặc trưng
     vec = np.zeros(4 + 7*max_pkgs, dtype=np.float32)
     
     # Đặc trưng robot: (r, c, carrying_flag, carrying_id)
-    vec[0] = r / map_size[0]  # normalize vị trí
-    vec[1] = c / map_size[1]
+    vec[0] = r0 / map_size[0]
+    vec[1] = c0 / map_size[1]
     vec[2] = 1.0 if carrying > 0 else 0.0
     vec[3] = carrying / max_pkgs if carrying > 0 else 0.0
     
-    # Đặc trưng cho mỗi package (tối đa max_pkgs gói)
+    # Đặc trưng cho mỗi package (tối đa max_pkgs gói), hỗ trợ tuple và object
     for i, pkg in enumerate(state['packages']):
         if i >= max_pkgs:
             break
         
         base = 4 + i*7
         
-        # Status encoding (one-hot: 'waiting', 'in_transit', 'delivered')
+        # Xử lý theo dạng tuple hoặc object
+        if isinstance(pkg, tuple):
+            # tuple: (id, start_r, start_c, target_r, target_c, start_time, deadline)
+            vec[base] = 1.0  # waiting
+            vec[base+1] = 0.0
+            vec[base+2] = 0.0
+            _, sr, sc, tr, tc, *rest = pkg
+            vec[base+3] = (sr - 1) / map_size[0]
+            vec[base+4] = (sc - 1) / map_size[1]
+            vec[base+5] = (tr - 1) / map_size[0]
+            vec[base+6] = (tc - 1) / map_size[1]
+        else:
+            # object có thuộc tính status, start, target
         if pkg.status == 'waiting':
             vec[base] = 1.0
         elif pkg.status == 'in_transit':
             vec[base+1] = 1.0
         elif pkg.status == 'delivered':
             vec[base+2] = 1.0
-            
-        # Vị trí start, target package (normalized)
         if hasattr(pkg, 'start') and pkg.start:
             vec[base+3] = pkg.start[0] / map_size[0]
             vec[base+4] = pkg.start[1] / map_size[1]
-            
         if hasattr(pkg, 'target') and pkg.target:
             vec[base+5] = pkg.target[0] / map_size[0]
             vec[base+6] = pkg.target[1] / map_size[1]

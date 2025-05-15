@@ -9,61 +9,64 @@ import os
 from tqdm import tqdm
 
 # ---- State Representation ----
-def state_to_vector(state, map_size=(10, 10), max_pkgs=10):
-    """Chuyển trạng thái môi trường thành feature vector cố định cho Autoencoder."""
-    # Thông tin robot: hỗ trợ cả tuple và object
+def state_to_vector(state, map_size=(10, 10), max_pkgs=10, max_time_steps=100):
+    """
+    Chuyển trạng thái môi trường thành feature vector:
+      - flatten bản đồ (obstacles)
+      - time_step
+      - thông tin robot
+      - đối với mỗi gói: status one-hot, tọa độ start/target, thời hạn còn lại và độ trễ
+    """
+    # Map
+    grid = np.array(state['map'], dtype=np.float32)
+    n_rows, n_cols = grid.shape
+    flat_map = grid.flatten()
+    # Time step
+    t = state.get('time_step', state.get('t', 0))
+    # Robot
     robot = state['robots'][0]
     if isinstance(robot, tuple):
-        r, c, carrying = robot
-        # env.get_state trả về vị trí 1-indexed
-        r0 = r - 1
-        c0 = c - 1
+        r, c, carrying = robot[:3]
+        r0, c0 = r - 1, c - 1
     else:
         r0, c0 = robot.position
-    carrying = robot.carrying
-
-    # Khởi tạo vector đặc trưng
-    vec = np.zeros(4 + 7*max_pkgs, dtype=np.float32)
-    
-    # Đặc trưng robot: (r, c, carrying_flag, carrying_id)
-    vec[0] = r0 / map_size[0]
-    vec[1] = c0 / map_size[1]
-    vec[2] = 1.0 if carrying > 0 else 0.0
-    vec[3] = carrying / max_pkgs if carrying > 0 else 0.0
-    
-    # Đặc trưng cho mỗi package (tối đa max_pkgs gói), hỗ trợ tuple và object
-    for i, pkg in enumerate(state['packages']):
-        if i >= max_pkgs:
-            break
-        
-        base = 4 + i*7
-        
-        # Xử lý theo dạng tuple hoặc object
-        if isinstance(pkg, tuple):
-            # tuple: (id, start_r, start_c, target_r, target_c, start_time, deadline)
-            vec[base] = 1.0  # waiting
-            vec[base+1] = 0.0
-            vec[base+2] = 0.0
-            _, sr, sc, tr, tc, *rest = pkg
-            vec[base+3] = (sr - 1) / map_size[0]
-            vec[base+4] = (sc - 1) / map_size[1]
-            vec[base+5] = (tr - 1) / map_size[0]
-            vec[base+6] = (tc - 1) / map_size[1]
-        else:
-            # object có thuộc tính status, start, target
-        if pkg.status == 'waiting':
-            vec[base] = 1.0
-        elif pkg.status == 'in_transit':
-            vec[base+1] = 1.0
-        elif pkg.status == 'delivered':
-            vec[base+2] = 1.0
-        if hasattr(pkg, 'start') and pkg.start:
-            vec[base+3] = pkg.start[0] / map_size[0]
-            vec[base+4] = pkg.start[1] / map_size[1]
-        if hasattr(pkg, 'target') and pkg.target:
-            vec[base+5] = pkg.target[0] / map_size[0]
-            vec[base+6] = pkg.target[1] / map_size[1]
-            
+        carrying = robot.carrying
+    # Khởi tạo vector
+    vec = np.zeros(1 + n_rows * n_cols + 4 + 9 * max_pkgs, dtype=np.float32)
+    idx = 0
+    # time_step
+    vec[idx] = t / max_time_steps
+    idx += 1
+    # flatten map
+    vec[idx: idx + n_rows * n_cols] = flat_map
+    idx += n_rows * n_cols
+    # robot features
+    vec[idx] = r0 / n_rows; vec[idx + 1] = c0 / n_cols
+    vec[idx + 2] = 1.0 if carrying > 0 else 0.0
+    vec[idx + 3] = carrying / max_pkgs if carrying > 0 else 0.0
+    idx += 4
+    # package features
+    for i in range(max_pkgs):
+        base = idx + i * 9
+        if i < len(state['packages']):
+            pkg = state['packages'][i]
+            if isinstance(pkg, tuple):
+                _, sr, sc, tr, tc, st, dl = pkg
+                status = 'waiting'
+            else:
+                sr, sc = pkg.start; tr, tc = pkg.target
+                st = pkg.start_time; dl = pkg.deadline; status = pkg.status
+            # status one-hot
+            vec[base]   = 1.0 if status == 'waiting' else 0.0
+            vec[base+1] = 1.0 if status == 'in_transit' else 0.0
+            vec[base+2] = 1.0 if status == 'delivered' else 0.0
+            # coords
+            vec[base+3] = (sr - 1) / n_rows; vec[base+4] = (sc - 1) / n_cols
+            vec[base+5] = (tr - 1) / n_rows; vec[base+6] = (tc - 1) / n_cols
+            # temporal
+            vec[base+7] = (dl - t) / max_time_steps
+            vec[base+8] = (t - st) / max_time_steps
+        # else giữ 0
     return vec
 
 # ---- Dataset ----

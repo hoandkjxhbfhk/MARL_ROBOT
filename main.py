@@ -1,10 +1,10 @@
-from env import Environment
-#from agent import Agents
-from greedyagent import GreedyAgents as Agents
-
-from env import Environment
-from coma_agent import COMAAgents
+import sys, os
+# Thêm path tới thư mục MAT envs
+sys.path.append(os.path.join(os.path.dirname(__file__), 'Multi-Agent-Transformer', 'mat'))
+from envs.delivery_env import DeliveryEnv
 from maddpg_agent import MADDPGAgents
+from greedyagent import GreedyAgents as Agents
+from coma_agent import COMAAgents
 
 import numpy as np
 import csv
@@ -29,9 +29,8 @@ if __name__=="__main__":
     args = parser.parse_args()
     np.random.seed(args.seed)
 
-    env = Environment(map_file=args.map, max_time_steps=args.max_time_steps,
-                      n_robots=args.num_agents, n_packages=args.n_packages,
-                      seed = args.seed)
+    # Sử dụng DeliveryEnv để nhận quan sát đầy đủ
+    env = DeliveryEnv(args)
     
     agents = MADDPGAgents(lr_actor=1e-4, lr_critic=1e-3)  # For MADDPG
     
@@ -44,28 +43,42 @@ if __name__=="__main__":
         for episode in range(args.num_episodes):
             # Thông báo bắt đầu episode để biết tiến độ
             print(f"Starting Episode {episode + 1}/{args.num_episodes}", flush=True)
-            state = env.reset()
-            agents.init_agents(state)
+            # Khởi tạo với quan sát đầy đủ cho mỗi agent
+            obs_n = env.reset()
+            agents.init_agents(obs_n)
             done = False
             episode_reward = 0
 
             while not done:
-                actions = agents.get_actions(state)
-                next_state, reward, done, infos = env.step(actions)
-                agents.remember(next_state, [reward]*args.num_agents, done)
-                state = next_state
-                episode_reward += reward
+                # Lấy hành động từ danh sách quan sát
+                actions = agents.get_actions(obs_n)
+                # Thực thi hành động và nhận quan sát mới
+                next_obs_n, reward_n, done_n, infos_n = env.step(actions)
+                # Flatten reward list-of-lists thành list các float
+                rewards = [r[0] if isinstance(r, (list, tuple, np.ndarray)) else r for r in reward_n]
+                # Lấy reward chung (giả sử giống nhau cho tất cả agents)
+                reward_scalar = rewards[0]
+                # Xác định điều kiện kết thúc khi tất cả agents done
+                done = all(done_n)
+                # Lấy info từ agent đầu tiên
+                infos = infos_n[0]
+                # Ghi nhớ trải nghiệm với danh sách rewards
+                agents.remember(next_obs_n, rewards, done)
+                obs_n = next_obs_n
+                episode_reward += reward_scalar
             
             # Cập nhật mạng một lần sau mỗi episode
             
 
-            log_writer.writerow([episode + 1, infos.get('total_reward', episode_reward), infos.get('total_time_steps', env.t),
+            log_writer.writerow([episode + 1,
+                                 infos.get('total_reward', episode_reward),
+                                 infos.get('total_time_steps', env.base_env.t),
                                  args.num_agents, args.n_packages, args.max_steps, args.map,
                                  agents.lr_actor, agents.lr_critic])
 
             # Thông báo kết thúc episode
             print(f"Episode {episode + 1}/{args.num_episodes} finished", flush=True)
             print(f"  Total reward: {infos.get('total_reward', episode_reward)}", flush=True)
-            print(f"  Total time steps: {infos.get('total_time_steps', env.t)}", flush=True)
+            print(f"  Total time steps: {infos.get('total_time_steps', env.base_env.t)}", flush=True)
 
     print(f"Training finished. Log saved to {args.log_file}")

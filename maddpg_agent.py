@@ -89,7 +89,7 @@ class MADDPGAgents:
         self.batch_size = batch_size
         self.buffer_size = buffer_size
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+        self.device = torch.device("cuda:2")
         self.num_agents = 0
         self.obs_dim = None
         self.total_obs_dim = None
@@ -128,20 +128,11 @@ class MADDPGAgents:
     def tuple_to_env_action(move_idx, pkg_idx):
         return (action_move[move_idx], action_pkg[pkg_idx])
 
-    def _extract_agent_obs(self, state, agent_id):
-        """Very naive encoding: agent (row, col, carrying) & time step."""
-        robot = state['robots'][agent_id]
-        robot_row = robot[0] / len(state['map'])  # normalised 0-1
-        robot_col = robot[1] / len(state['map'][0])
-        carrying = robot[2]
-        time_step = state['time_step'] / 1000.0  # assume max 1000
-        obs = np.array([robot_row, robot_col, carrying, time_step], dtype=np.float32)
-        return obs
-
-    def init_agents(self, state):
-        self.num_agents = len(state['robots'])
-        # Use simple obs dim as above
-        self.obs_dim = 4
+    def init_agents(self, initial_obs):
+        """Khởi tạo agents với quan sát đầy đủ cho mỗi agent."""
+        self.num_agents = len(initial_obs)
+        # dim của quan sát là độ dài vector quan sát mỗi agent
+        self.obs_dim = len(initial_obs[0])
         self.total_obs_dim = self.obs_dim * self.num_agents
         # Action dim is one-hot MOVE+PKG for each agent
         self.total_action_dim = (MOVE_DIM + PKG_DIM) * self.num_agents
@@ -164,9 +155,9 @@ class MADDPGAgents:
             self.critic_optimisers.append(optim.Adam(critic.parameters(), lr=self.lr_critic))
 
     # -----------------------------------------------------------------------
-    def get_actions(self, state, explore=True):
-        # Build per-agent obs tensors
-        obs_n = [self._extract_agent_obs(state, i) for i in range(self.num_agents)]
+    def get_actions(self, obs_n, explore=True):
+        """Tạo actions dựa trên danh sách quan sát đầy đủ obs_n."""
+        # obs_n là list các numpy array quan sát đầy đủ của mỗi agent
         obs_tensor_n = [torch.tensor(o, dtype=torch.float32, device=self.device).unsqueeze(0)
                         for o in obs_n]
 
@@ -180,19 +171,20 @@ class MADDPGAgents:
                 moves.append(move_idx)
                 pkgs.append(pkg_idx)
                 actions_for_env.append(self.tuple_to_env_action(move_idx, pkg_idx))
-        self.latest_obs = obs_n  # store for memory
+        self.latest_obs = obs_n  # lưu quan sát mới nhất để ghi nhớ
         self.latest_actions = [self.encode_action_tuple(m, p) for m, p in zip(moves, pkgs)]
         return actions_for_env
 
-    def remember(self, next_state, rewards, done):
-        # Build next obs list
-        next_obs_n = [self._extract_agent_obs(next_state, i) for i in range(self.num_agents)]
+    def remember(self, next_obs_n, rewards, done):
+        """Ghi nhớ trải nghiệm với next_obs_n danh sách quan sát đầy đủ."""
         # Flatten lists for storage
-        self.memory.push(np.concatenate(self.latest_obs),
-                         np.concatenate(self.latest_actions),
-                         np.array(rewards, dtype=np.float32),
-                         np.concatenate(next_obs_n),
-                         np.array(done, dtype=np.float32))
+        self.memory.push(
+            np.concatenate(self.latest_obs),
+            np.concatenate(self.latest_actions),
+            np.array(rewards, dtype=np.float32),
+            np.concatenate(next_obs_n),
+            np.array(done, dtype=np.float32)
+        )
 
         self.latest_obs = None
         self.latest_actions = None

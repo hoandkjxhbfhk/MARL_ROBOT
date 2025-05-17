@@ -10,6 +10,7 @@ import numpy as np
 import random
 import os
 from sklearn.calibration import LabelEncoder
+import argparse
 
 
 
@@ -49,6 +50,13 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
+
+parser = argparse.ArgumentParser(description="Configure QMIX training and checkpoint")
+parser.add_argument("--checkpoint_prefix", type=str, default=None, help="Prefix path to load checkpoint models")
+parser.add_argument("--start_episode", type=int, default=1, help="Episode number to start training from")
+parser.add_argument("--num_episodes", type=int, default=NUM_EPISODES, help="Total number of episodes to run")
+args = parser.parse_args()
+
 def convert_observation(state, persistent_packages, current_robot_idx):
     """
     Convert state to a 2D multi-channel tensor for a specific robot.
@@ -525,7 +533,7 @@ def exponential_epsilon(steps_done):
     return EPS_END + (EPS_START - EPS_END) * np.exp(-steps_done / EPS_DECAY)
 
 # Recalculate epsilon values using the defined functions
-steps_done = np.arange(NUM_EPISODES)
+steps_done = np.arange(args.num_episodes)
 
 linear_epsilons = [linear_epsilon(step) for step in steps_done]
 exp_epsilons = [exponential_epsilon(step) for step in steps_done]
@@ -1110,6 +1118,10 @@ import pygame
 
 
 trainer = QMixTrainer(env=env, use_data_parallel=True, rnn_hidden_dim=RNN_HIDDEN_DIM) # Pass RNN_HIDDEN_DIM
+if args.checkpoint_prefix:
+    print(f"Loading checkpoint from {args.checkpoint_prefix}")
+    trainer.load_models(args.checkpoint_prefix)
+    print(f"Resuming training from episode {args.start_episode}")
 
 # Lists to store metrics for plotting
 episode_rewards_history = []
@@ -1117,10 +1129,10 @@ episode_avg_loss_history = []
 
 training_completed_successfully = False
 print("Starting QMIX training...")
-print(f"Running for {NUM_EPISODES} episodes.")
+print(f"Running for {args.num_episodes} episodes, starting at episode {args.start_episode}.")
 
 try:
-    for episode_num in range(1, NUM_EPISODES + 1):
+    for episode_num in range(args.start_episode, args.num_episodes + 1):
         # The exponential_epsilon function from in[16] expects 'steps_done'
         # Assuming 'steps_done' in that context refers to the number of episodes completed (0-indexed)
         current_epsilon = linear_epsilon(episode_num - 1) 
@@ -1130,8 +1142,8 @@ try:
         episode_rewards_history.append(episode_reward)
         episode_avg_loss_history.append(avg_episode_loss)
         
-        if episode_num % 10 == 0 or episode_num == NUM_EPISODES: # Print every 10 episodes and the last one
-            print(f"Episode {episode_num}/{NUM_EPISODES} | Reward: {episode_reward:.2f} | Avg Loss: {avg_episode_loss:.4f} | Epsilon: {current_epsilon:.3f}")
+        if episode_num % 10 == 0 or episode_num == args.num_episodes: # Print every 10 episodes and the last one
+            print(f"Episode {episode_num}/{args.num_episodes} | Reward: {episode_reward:.2f} | Avg Loss: {avg_episode_loss:.4f} | Epsilon: {current_epsilon:.3f}")
 
         # Optional: Periodic saving during training
         if episode_num % 50 == 0: # Example: Save every 50 episodes

@@ -46,6 +46,23 @@ MAX_GRAD_NORM = 0.5
 WEIGHT_DECAY = 1e-4
 
 
+# Helper ResNet Block
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual # Add skip connection
+        out = F.relu(out)
+        return out
+
 
 def convert_observation(env_state_dict, persistent_packages_for_env, current_robot_idx):
     """
@@ -329,24 +346,23 @@ class ActorNetwork(nn.Module):
         self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
-        self.conv3 = nn.Conv2d(64, cnn_channels_out, kernel_size=3, stride=1, padding=1) # Last conv layer
+        self.conv3 = nn.Conv2d(64, cnn_channels_out, kernel_size=3, stride=1, padding=1)
         self.bn3 = nn.BatchNorm2d(cnn_channels_out)
+        self.res_block1 = ResBlock(cnn_channels_out)
 
-        # Adaptive pooling to get a fixed size output from CNN, regardless of map_h, map_w (within reason)
-        # This avoids calculating flattened_size manually if map dimensions might vary slightly
-        # or if you want more flexibility. Output size of (e.g., 4x4) from pooling.
         self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))
-        self.cnn_flattened_dim = cnn_channels_out * 4 * 4 # Output from adaptive_pool
+        self.cnn_flattened_dim = cnn_channels_out * 4 * 4
 
         # --- MLP Branch for Vector Observations ---
         self.vector_fc1 = nn.Linear(vector_obs_dim, mlp_hidden_dim)
-        self.vector_fc2 = nn.Linear(mlp_hidden_dim, mlp_hidden_dim // 2) # Reduce dim slightly
+        self.vector_fc2 = nn.Linear(mlp_hidden_dim, mlp_hidden_dim)
+        self.vector_fc3 = nn.Linear(mlp_hidden_dim, mlp_hidden_dim // 2)
 
         # --- Combined MLP ---
-        # Input to this MLP is the concatenation of CNN output and Vector MLP output
         combined_input_dim = self.cnn_flattened_dim + (mlp_hidden_dim // 2)
         self.combined_fc1 = nn.Linear(combined_input_dim, combined_hidden_dim)
-        self.actor_head = nn.Linear(combined_hidden_dim, action_dim)
+        self.combined_fc2 = nn.Linear(combined_hidden_dim, combined_hidden_dim // 2)
+        self.actor_head = nn.Linear(combined_hidden_dim // 2, action_dim)
 
     def forward(self, spatial_obs, vector_obs):
         """
@@ -360,18 +376,20 @@ class ActorNetwork(nn.Module):
         x_spatial = F.relu(self.bn1(self.conv1(spatial_obs)))
         x_spatial = F.relu(self.bn2(self.conv2(x_spatial)))
         x_spatial = F.relu(self.bn3(self.conv3(x_spatial)))
+        x_spatial = self.res_block1(x_spatial)
         x_spatial = self.adaptive_pool(x_spatial)
-        x_spatial_flat = x_spatial.reshape(x_spatial.size(0), -1) # Flatten
+        x_spatial_flat = x_spatial.reshape(x_spatial.size(0), -1)
 
         # Vector MLP path
         x_vector = F.relu(self.vector_fc1(vector_obs))
-        x_vector_processed = F.relu(self.vector_fc2(x_vector))
+        x_vector = F.relu(self.vector_fc2(x_vector))
+        x_vector_processed = F.relu(self.vector_fc3(x_vector))
 
-        # Concatenate processed features
         combined_features = torch.cat((x_spatial_flat, x_vector_processed), dim=1)
 
         # Combined MLP path
         x_combined = F.relu(self.combined_fc1(combined_features))
+        x_combined = F.relu(self.combined_fc2(x_combined))
         action_logits = self.actor_head(x_combined)
 
         return action_logits
@@ -402,18 +420,21 @@ class CriticNetwork(nn.Module):
         self.bn2 = nn.BatchNorm2d(64)
         self.conv3 = nn.Conv2d(64, cnn_channels_out, kernel_size=3, stride=1, padding=1)
         self.bn3 = nn.BatchNorm2d(cnn_channels_out)
+        self.res_block1 = ResBlock(cnn_channels_out)
 
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4)) # Fixed output size
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))
         self.cnn_flattened_dim = cnn_channels_out * 4 * 4
 
         # --- MLP Branch for Global Vector State ---
         self.vector_fc1 = nn.Linear(global_vector_state_dim, mlp_hidden_dim)
-        self.vector_fc2 = nn.Linear(mlp_hidden_dim, mlp_hidden_dim // 2)
+        self.vector_fc2 = nn.Linear(mlp_hidden_dim, mlp_hidden_dim)
+        self.vector_fc3 = nn.Linear(mlp_hidden_dim, mlp_hidden_dim // 2)
 
         # --- Combined MLP ---
         combined_input_dim = self.cnn_flattened_dim + (mlp_hidden_dim // 2)
         self.combined_fc1 = nn.Linear(combined_input_dim, combined_hidden_dim)
-        self.critic_head = nn.Linear(combined_hidden_dim, 1) # Outputs a single state value
+        self.combined_fc2 = nn.Linear(combined_hidden_dim, combined_hidden_dim // 2)
+        self.critic_head = nn.Linear(combined_hidden_dim // 2, 1)
 
     def forward(self, global_spatial_state, global_vector_state):
         """
@@ -427,41 +448,43 @@ class CriticNetwork(nn.Module):
         x_spatial = F.relu(self.bn1(self.conv1(global_spatial_state)))
         x_spatial = F.relu(self.bn2(self.conv2(x_spatial)))
         x_spatial = F.relu(self.bn3(self.conv3(x_spatial)))
+        x_spatial = self.res_block1(x_spatial)
         x_spatial = self.adaptive_pool(x_spatial)
         x_spatial_flat = x_spatial.reshape(x_spatial.size(0), -1)
 
         # Vector MLP path
         x_vector = F.relu(self.vector_fc1(global_vector_state))
-        x_vector_processed = F.relu(self.vector_fc2(x_vector))
+        x_vector = F.relu(self.vector_fc2(x_vector))
+        x_vector_processed = F.relu(self.vector_fc3(x_vector))
 
-        # Concatenate processed features
         combined_features = torch.cat((x_spatial_flat, x_vector_processed), dim=1)
 
         # Combined MLP path
         x_combined = F.relu(self.combined_fc1(combined_features))
+        x_combined = F.relu(self.combined_fc2(x_combined))
         value = self.critic_head(x_combined)
 
         return value
     
     
     
-def save_mappo_model(actor, critic, path_prefix="models/mappo"):
+def save_mappo_model(actor, critic, path_prefix="models_newcnn_newcnn/mappo"):
     if not os.path.exists(os.path.dirname(path_prefix)):
         os.makedirs(os.path.dirname(path_prefix))
     torch.save(actor.state_dict(), f"{path_prefix}_actor.pt")
     torch.save(critic.state_dict(), f"{path_prefix}_critic.pt")
-    print(f"MAPPO models saved with prefix {path_prefix}")
+    print(f"MAPPO models_newcnn_newcnn saved with prefix {path_prefix}")
 
 
-def load_mappo_model(actor, critic, path_prefix="models/mappo", device="cpu"):
+def load_mappo_model(actor, critic, path_prefix="models_newcnn_newcnn/mappo", device="cpu"):
     actor_path = f"{path_prefix}_actor.pt"
     critic_path = f"{path_prefix}_critic.pt"
     if os.path.exists(actor_path) and os.path.exists(critic_path):
         actor.load_state_dict(torch.load(actor_path, map_location=device))
         critic.load_state_dict(torch.load(critic_path, map_location=device))
-        print(f"MAPPO models loaded from prefix {path_prefix}")
+        print(f"MAPPO models_newcnn_newcnn loaded from prefix {path_prefix}")
         return True
-    print(f"Could not find MAPPO models at prefix {path_prefix}")
+    print(f"Could not find MAPPO models_newcnn_newcnn at prefix {path_prefix}")
     return False
 
 
@@ -1048,7 +1071,7 @@ try:
 
         if update_num % 100 == 0: # Save model periodically
             print(f"Saving checkpoint at update {update_num}...")
-            save_mappo_model(trainer.actor, trainer.critic, path_prefix=f"models/mappo_update{update_num}")
+            save_mappo_model(trainer.actor, trainer.critic, path_prefix=f"models_newcnn_newcnn/mappo_update{update_num}")
 
 except KeyboardInterrupt:
     print("\nTraining interrupted by user.")
@@ -1058,7 +1081,7 @@ except Exception as e:
     traceback.print_exc()
 finally:
     print("Saving final model...")
-    save_mappo_model(trainer.actor, trainer.critic, path_prefix="models/mappo_final")
+    save_mappo_model(trainer.actor, trainer.critic, path_prefix="models_newcnn_newcnn/mappo_final")
     print("\nTraining loop finished or was interrupted.")
 
     # Plotting
@@ -1090,7 +1113,8 @@ finally:
     plt.xlabel('Update Number')
     plt.ylabel('Total Reward')
     plt.grid(True)
+    
+    plt.savefig("plots/mappo_training_plots.png")
 
     plt.tight_layout()
     plt.show()
-            

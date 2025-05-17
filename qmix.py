@@ -1,809 +1,910 @@
-try:
     from marl_delivery.env import Environment
-except:
-    from env import Environment
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
+from torch.distributions import Categorical
 import numpy as np
 import random
 import os
-from sklearn.calibration import LabelEncoder
-import argparse
-
-
-
-
-
-
-ACTION_DIM = 15
-NUM_AGENTS = 5
-MAP_FILE = "map1.txt"
-N_PACKAGES = 20
-
-# Normalize reward
-MOVE_COST = -0.01 
-DELIVERY_REWARD = 10
-DELAY_REWARD = 1
-
-MAX_TIME_STEPS = 200
-MIXING_DIM = 32
-RNN_HIDDEN_DIM = 64
-NUM_EPISODES = 1000
-BATCH_SIZE = 128
-GAMMA = 0.99
-LR = 5e-5
-WEIGHT_DECAY = 1e-3
-MAX_REPLAY_BUFFER_SIZE = 10000
-EPS_START = 1
-EPS_END = 0.1
-EPS_DECAY = 1000
-TAU = 0.001
-GRADIENT_CLIPPING = 10
-
-
+from sklearn.preprocessing import LabelEncoder # For action conversion
+import matplotlib.pyplot as plt
 
 SEED = 42
-device = torch.device("cuda:22" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
 
-parser = argparse.ArgumentParser(description="Configure QMIX training and checkpoint")
-parser.add_argument("--checkpoint_prefix", type=str, default=None, help="Prefix path to load checkpoint models")
-parser.add_argument("--start_episode", type=int, default=1, help="Episode number to start training from")
-parser.add_argument("--num_episodes", type=int, default=NUM_EPISODES, help="Total number of episodes to run")
-args = parser.parse_args()
-
-def convert_observation(state, persistent_packages, current_robot_idx):
+def convert_observation(env_state_dict, persistent_packages_for_env, current_robot_idx):
     """
-    Convert state to a 2D multi-channel tensor for a specific robot.
-    - 6 channels for robot-specific observation:
-        0. Map
-        1. Urgency of 'waiting' packages (if robot is not carrying)
-        2. Start positions of 'waiting' packages (if robot is not carrying)
-        3. Other robots' positions
-        4. Current robot's position
-        5. Current robot's carried package target (if robot is carrying)
-
-    Args:
-        state (dict): Raw state from the environment.
-                      Expected keys: "map", "robots", "time_step".
-                      state["robots"] is a list of tuples: (pos_x+1, pos_y+1, carrying_package_id)
-        persistent_packages (dict): Dictionary tracking all active packages.
-                                    Positions are 0-indexed.
-        current_robot_idx (int): Index of the current robot for which to generate the observation.
-
-    Returns:
-        np.ndarray of shape (6, n_rows, n_cols)
+    Tạo observation dạng multi-channel cho 1 robot.
+    Channels:
+        0: Obstacle map
+        1: Vị trí robot hiện tại
+        2: Vị trí các robot khác
+        3: Vị trí start của các package 'waiting'
+        4: Vị trí target của các package 'active' (waiting hoặc in_transit)
+        5: Vị trí target của package mà robot này đang cầm (nếu có)
     """
-    grid = np.array(state["map"])
+    num_channels = 6
+    grid = np.array(env_state_dict['map'], dtype=np.float32)
     n_rows, n_cols = grid.shape
-    n_channels = 6
-    tensor = np.zeros((n_channels, n_rows, n_cols), dtype=np.float32)
+    obs = np.zeros((num_channels, n_rows, n_cols), dtype=np.float32)
 
-    # --- Channel 0: Map ---
-    tensor[0] = grid
+    # Channel 0: Obstacle map
+    obs[0] = grid
 
-    current_time_step = state["time_step"]
-    if isinstance(current_time_step, np.ndarray): # Handle case where time_step might be an array
-        current_time_step = current_time_step[0]
+    # Kiểm tra robot index hợp lệ
+    if not (0 <= current_robot_idx < len(env_state_dict['robots'])):
+        return obs
 
-    # Get current robot's data and determine if it's carrying a package
-    # Ensure current_robot_idx is valid
-    if current_robot_idx < 0 or current_robot_idx >= len(state["robots"]):
-        # This case should ideally be handled by the caller or indicate an error
-        # print(f"Warning: Invalid current_robot_idx {current_robot_idx}")
-        return tensor # Return empty tensor or handle error appropriately
+    robots = env_state_dict['robots']
+    my_r, my_c, my_pkg = [int(x) for x in robots[current_robot_idx]]
+    my_r -= 1; my_c -= 1  # 0-indexed
 
-    current_robot_data = state["robots"][current_robot_idx]
-    carried_pkg_id_by_current_robot = current_robot_data[2] # 1-indexed ID, 0 if not carrying
+    # Channel 1: Vị trí robot hiện tại
+    if 0 <= my_r < n_rows and 0 <= my_c < n_cols:
+        obs[1, my_r, my_c] = 1.0
 
-    # --- Channel 1: Urgency of 'waiting' packages (if robot is not carrying) ---
-    # --- Channel 2: Start positions of 'waiting' packages (if robot is not carrying) ---
-    if carried_pkg_id_by_current_robot == 0: # Robot is NOT carrying a package
-        for pkg_id, pkg_data in persistent_packages.items():
-            if pkg_data['status'] == 'waiting':
-                sr, sc = pkg_data['start_pos']  # 0-indexed
-                st = pkg_data['start_time']
-                dl = pkg_data['deadline']
+    # Channel 2: Vị trí các robot khác
+    for i, (r, c, _) in enumerate(robots):
+        if i == current_robot_idx: continue
+        r, c = int(r)-1, int(c)-1
+        if 0 <= r < n_rows and 0 <= c < n_cols:
+            obs[2, r, c] = 1.0
 
-                # Check if package is active (start_time has passed)
-                if current_time_step >= st:
-                    # Channel 1: Urgency
-                    urgency = 0
-                    if dl > st: # Avoid division by zero or negative duration
-                        # Normalize urgency: 0 (just appeared) to 1 (deadline reached)
-                        # Cap at 1 if current_time_step exceeds deadline
-                        urgency = min(1.0, max(0.0, (current_time_step - st) / (dl - st)))
-                    elif dl == st: # Deadline is the start time
-                         urgency = 1.0 if current_time_step >= st else 0.0
-                    # else: dl < st, invalid, urgency remains 0
+    # Channel 3, 4, 5: Package info
+    t = env_state_dict['time_step']
+    for pkg_id, pkg in persistent_packages_for_env.items():
+        # Channel 3: Start pos của package 'waiting'
+        if pkg['status'] == 'waiting' and pkg['start_time'] <= t:
+            sr, sc = pkg['start_pos']
+            if 0 <= sr < n_rows and 0 <= sc < n_cols:
+                obs[3, sr, sc] = 1.0
+        # Channel 4: Target pos của package 'active'
+        if (pkg['status'] == 'waiting' and pkg['start_time'] <= t) or pkg['status'] == 'in_transit':
+            tr, tc = pkg['target_pos']
+            if 0 <= tr < n_rows and 0 <= tc < n_cols:
+                obs[4, tr, tc] = 1.0
 
-                    if 0 <= sr < n_rows and 0 <= sc < n_cols: # Boundary check
-                        tensor[1, sr, sc] = max(tensor[1, sr, sc], urgency) # Use max if multiple pkgs at same spot
+    # Channel 5: Target pos của package mà robot này đang cầm
+    if my_pkg != 0 and my_pkg in persistent_packages_for_env:
+        pkg = persistent_packages_for_env[my_pkg]
+        if pkg['status'] == 'in_transit':
+            tr, tc = pkg['target_pos']
+            if 0 <= tr < n_rows and 0 <= tc < n_cols:
+                obs[5, tr, tc] = 1.0
 
-                    # Channel 2: Start position
-                    if 0 <= sr < n_rows and 0 <= sc < n_cols: # Boundary check
-                        tensor[2, sr, sc] = 1.0 # Mark presence
-    # If robot is carrying, channels 1 and 2 remain all zeros.
+    return obs
 
-    # --- Channel 3: Other robots' positions ---
-    for i, rob_data in enumerate(state["robots"]):
-        if i == current_robot_idx:
-            continue # Skip the current robot
-        rr, rc, _ = rob_data # Positions are 1-indexed from env
-        rr_idx, rc_idx = int(rr) - 1, int(rc) - 1 # Convert to 0-indexed
-        if 0 <= rr_idx < n_rows and 0 <= rc_idx < n_cols: # Boundary check
-            tensor[3, rr_idx, rc_idx] = 1.0
-
-    # --- Channel 4: Current robot's position ---
-    # current_robot_data was fetched earlier
-    crr, crc, _ = current_robot_data # Positions are 1-indexed
-    crr_idx, crc_idx = int(crr) - 1, int(crc) - 1 # Convert to 0-indexed
-    if 0 <= crr_idx < n_rows and 0 <= crc_idx < n_cols: # Boundary check
-        tensor[4, crr_idx, crc_idx] = 1.0
-
-    # --- Channel 5: Current robot's carried package target (if robot is carrying) ---
-    if carried_pkg_id_by_current_robot != 0:
-        # Ensure the package ID from state['robots'] is valid and exists in persistent_packages
-        if carried_pkg_id_by_current_robot in persistent_packages:
-            pkg_data_carried = persistent_packages[carried_pkg_id_by_current_robot]
-            # Double check status, though if robot carries it, it should be 'in_transit'
-            # or just became 'in_transit' in the persistent_packages update logic.
-            # For this observation, we primarily care about its target.
-            tr_carried, tc_carried = pkg_data_carried['target_pos'] # 0-indexed
-            if 0 <= tr_carried < n_rows and 0 <= tc_carried < n_cols: # Boundary check
-                tensor[5, tr_carried, tc_carried] = 1.0
-        # else:
-            # This case might indicate an inconsistency.
-            # print(f"Warning: Robot {current_robot_idx} carrying pkg {carried_pkg_id_by_current_robot} not in persistent_packages.")
-    # If robot is not carrying, channel 5 remains all zeros.
-
-    return tensor
-
-def convert_state(state_dict, persistent_packages, state_tensor_shape):
+def generate_vector_features(env_state_dict, persistent_packages_for_env, current_robot_idx,
+                            max_time_steps,
+                            max_other_robots_to_observe, max_packages_to_observe):
     """
-    Converts the global state dictionary to a tensor for QMIX.
-    Relies on `persistent_packages` for all package information.
-    The `packages` key in `state_dict` (if present) is ignored for package data.
-
-    Args:
-        state_dict (dict): The raw environment state dictionary.
-                           Expected keys: "map", "robots", "time_step".
-        persistent_packages (dict): Dictionary tracking all active packages.
-                                    Positions are 0-indexed.
-                                    Example entry:
-                                    { pkg_id: {'start_pos': (r,c), 'target_pos': (r,c),
-                                                'status': 'waiting'/'in_transit',
-                                                'start_time': ts, 'deadline': dl, 'id': pkg_id} }
-        state_tensor_shape (tuple): Tuple (num_channels, n_rows, n_cols) for the output state tensor.
-        max_time_steps (int): Maximum time steps in an episode for normalization.
-
-    Returns:
-        np.ndarray: The global state tensor with shape specified by state_tensor_shape.
-        float: Normalized current time step (scalar feature).
+    Sinh vector đặc trưng phi không gian cho 1 robot.
     """
-    num_channels_out, n_rows, n_cols = state_tensor_shape
-    
-    spatial_tensor = np.zeros((num_channels_out, n_rows, n_cols), dtype=np.float32)
+    n_rows, n_cols = np.array(env_state_dict['map'], dtype=np.float32).shape
+    robots = env_state_dict['robots']
+    t = env_state_dict['time_step']
 
-    CH_IDX_MAP_OBSTACLES = 0
-    CH_IDX_ROBOT_POSITIONS = 1
-    CH_IDX_ROBOT_CARRYING_STATUS = 2
-    CH_IDX_PKG_WAITING_START_POS = 3
-    CH_IDX_PKG_WAITING_TARGET_POS = 4
-    CH_IDX_PKG_IN_TRANSIT_TARGET_POS = 5
-    CH_IDX_PKG_WAITING_URGENCY = 6
+    # Định nghĩa số chiều cho từng phần
+    my_feat = 6
+    other_feat = 5
+    pkg_feat = 5
+    time_feat = 1
 
-    # --- Channel: Map Obstacles (Centering/Cropping Logic) ---
-    if CH_IDX_MAP_OBSTACLES < num_channels_out:
-        game_map_from_state = np.array(state_dict["map"])
-        map_rows_src, map_cols_src = game_map_from_state.shape
+    # Nếu robot index không hợp lệ, trả về vector 0
+    total_len = my_feat + max_other_robots_to_observe * other_feat + max_packages_to_observe * pkg_feat + time_feat
+    if not (0 <= current_robot_idx < len(robots)):
+        return np.zeros(total_len, dtype=np.float32)
 
-        src_r_start = (map_rows_src - n_rows) // 2 if map_rows_src > n_rows else 0
-        src_c_start = (map_cols_src - n_cols) // 2 if map_cols_src > n_cols else 0
-        
-        rows_to_copy_from_src = min(map_rows_src, n_rows)
-        cols_to_copy_from_src = min(map_cols_src, n_cols)
+    # 1. Thông tin robot hiện tại
+    my_r, my_c, my_pkg = [int(x) for x in robots[current_robot_idx]]
+    my_r -= 1; my_c -= 1
+    is_carrying = 1.0 if my_pkg != 0 else 0.0
+    feat = [
+        my_r / n_rows,
+        my_c / n_cols,
+        is_carrying
+    ]
+    # Nếu đang cầm package
+    if is_carrying and my_pkg in persistent_packages_for_env:
+        pkg = persistent_packages_for_env[my_pkg]
+        if pkg['status'] == 'in_transit':
+            tr, tc = pkg['target_pos']
+            deadline = pkg['deadline']
+            feat += [
+                (tr - my_r) / n_rows,
+                (tc - my_c) / n_cols,
+                max(0, deadline - t) / max_time_steps if max_time_steps > 0 else 0.0
+            ]
+        else:
+            feat += [0.0, 0.0, 0.0]
+    else:
+        feat += [0.0, 0.0, 0.0]
 
-        map_section_to_copy = game_map_from_state[
-            src_r_start : src_r_start + rows_to_copy_from_src,
-            src_c_start : src_c_start + cols_to_copy_from_src
+    # 2. Thông tin các robot khác
+    others = []
+    for i, (r, c, pkg_id) in enumerate(robots):
+        if i == current_robot_idx: continue
+        r, c, pkg_id = int(r)-1, int(c)-1, int(pkg_id)
+        is_c = 1.0 if pkg_id != 0 else 0.0
+        other = [
+            (r - my_r) / n_rows,
+            (c - my_c) / n_cols,
+            is_c
         ]
-        
-        target_r_offset = (n_rows - map_section_to_copy.shape[0]) // 2
-        target_c_offset = (n_cols - map_section_to_copy.shape[1]) // 2
-            
-        spatial_tensor[
-            CH_IDX_MAP_OBSTACLES,
-            target_r_offset : target_r_offset + map_section_to_copy.shape[0],
-            target_c_offset : target_c_offset + map_section_to_copy.shape[1]
-        ] = map_section_to_copy
+        if is_c and pkg_id in persistent_packages_for_env:
+            pkg = persistent_packages_for_env[pkg_id]
+            if pkg['status'] == 'in_transit':
+                tr, tc = pkg['target_pos']
+                other += [
+                    (tr - r) / n_rows,
+                    (tc - c) / n_cols
+                ]
+            else:
+                other += [0.0, 0.0]
+        else:
+            other += [0.0, 0.0]
+        others.append(other)
+    # Sắp xếp theo khoảng cách tới robot hiện tại
+    others.sort(key=lambda x: x[0]**2 + x[1]**2)
+    for i in range(max_other_robots_to_observe):
+        feat += others[i] if i < len(others) else [0.0]*other_feat
 
-    # --- Current Time (Scalar Feature) ---
-    current_time = state_dict["time_step"]
+    # 3. Thông tin các package 'waiting'
+    pkgs = []
+    for pkg_id, pkg in persistent_packages_for_env.items():
+        if pkg['status'] == 'waiting' and pkg['start_time'] <= t:
+            sr, sc = pkg['start_pos']
+            tr, tc = pkg['target_pos']
+            deadline = pkg['deadline']
+            pkgs.append([
+                (sr - my_r) / n_rows,
+                (sc - my_c) / n_cols,
+                (tr - my_r) / n_rows,
+                (tc - my_c) / n_cols,
+                max(0, deadline - t) / max_time_steps if max_time_steps > 0 else 0.0
+            ])
+    # Sắp xếp theo deadline và khoảng cách
+    pkgs.sort(key=lambda x: (x[4], x[0]**2 + x[1]**2))
+    for i in range(max_packages_to_observe):
+        feat += pkgs[i] if i < len(pkgs) else [0.0]*pkg_feat
 
-    # --- Channels: Robot Positions and Carrying Status (from state_dict['robots']) ---
-    if 'robots' in state_dict and state_dict['robots'] is not None:
-        for r_data in state_dict['robots']:
-            # r_data: (pos_r_1idx, pos_c_1idx, carrying_package_id)
-            r_idx, c_idx = int(r_data[0]) - 1, int(r_data[1]) - 1 # Convert to 0-indexed
-            carried_pkg_id = r_data[2]
+    # 4. Thời gian toàn cục (chuẩn hóa)
+    feat.append(t / max_time_steps if max_time_steps > 0 else 0.0)
 
-            if 0 <= r_idx < n_rows and 0 <= c_idx < n_cols: # Boundary check
-                if CH_IDX_ROBOT_POSITIONS < num_channels_out:
-                    spatial_tensor[CH_IDX_ROBOT_POSITIONS, r_idx, c_idx] = 1.0
-                
-                if carried_pkg_id != 0 and CH_IDX_ROBOT_CARRYING_STATUS < num_channels_out:
-                    spatial_tensor[CH_IDX_ROBOT_CARRYING_STATUS, r_idx, c_idx] = 1.0
+    return np.array(feat, dtype=np.float32)
 
-    # --- Process persistent_packages for ALL package-related channels ---
-    # Note: state_dict['packages'] is NOT used here.
-    for pkg_id, pkg_data in persistent_packages.items():
-        start_pos = pkg_data['start_pos']   # Expected (r, c) 0-indexed
-        target_pos = pkg_data['target_pos'] # Expected (r, c) 0-indexed
-        status = pkg_data['status']
-        pkg_start_time = pkg_data['start_time']
-        pkg_deadline = pkg_data['deadline']
-        
-        # Process only if package is active based on its start_time
-        if current_time >= pkg_start_time:
+def convert_global_state(env_state_dict, persistent_packages_for_env,
+                                max_time_steps,
+                                max_robots_in_state=100, max_packages_in_state=100):
+    """
+    Sinh global state (spatial + vector) cho Critic.
+    """
+    # --- Spatial ---
+    num_map_channels = 4
+    n_rows, n_cols = np.array(env_state_dict['map'], dtype=np.float32).shape
+    
+    global_map = np.zeros((num_map_channels, n_rows, n_cols), dtype=np.float32)
+    global_map[0] = np.array(env_state_dict['map'], dtype=np.float32)  # Obstacles
+
+    # Channel 1: All robot positions
+    for r, c, _ in env_state_dict['robots']:
+        r0, c0 = int(r)-1, int(c)-1
+        if 0 <= r0 < n_rows and 0 <= c0 < n_cols:
+            global_map[1, r0, c0] = 1.0
+
+    t = env_state_dict['time_step']
+    for pkg in persistent_packages_for_env.values():
+        # Channel 2: waiting package start
+        if pkg['status'] == 'waiting' and pkg['start_time'] <= t:
+            sr, sc = pkg['start_pos']
+            if 0 <= sr < n_rows and 0 <= sc < n_cols:
+                global_map[2, sr, sc] = 1.0
+        # Channel 3: active package target
+        if (pkg['status'] == 'waiting' and pkg['start_time'] <= t) or pkg['status'] == 'in_transit':
+            tr, tc = pkg['target_pos']
+            if 0 <= tr < n_rows and 0 <= tc < n_cols:
+                global_map[3, tr, tc] = 1.0
+
+    # --- Vector ---
+    vec = []
+    # 1. Robots (padded)
+    for i in range(max_robots_in_state):
+        if i < len(env_state_dict['robots']):
+            r, c, carried = env_state_dict['robots'][i]
+            r0, c0 = int(r)-1, int(c)-1
+            is_carrying = 1.0 if carried != 0 else 0.0
+            vec += [r0/n_rows, c0/n_cols, is_carrying]
+            if is_carrying and carried in persistent_packages_for_env:
+                pkg = persistent_packages_for_env[carried]
+                if pkg['status'] == 'in_transit':
+                    tr, tc = pkg['target_pos']
+                    deadline = pkg['deadline']
+                    vec += [tr/n_rows, tc/n_cols, max(0, deadline-t)/max_time_steps if max_time_steps > 0 else 0.0]
+                else:
+                    vec += [0.0, 0.0, 0.0]
+            else:
+                vec += [0.0, 0.0, 0.0]
+        else:
+            vec += [0.0]*6
+
+    # 2. Active packages (padded)
+    pkgs = []
+    for pkg in persistent_packages_for_env.values():
+        is_active = (pkg['status'] == 'waiting' and pkg['start_time'] <= t) or pkg['status'] == 'in_transit'
+        if is_active:
+            pkgs.append(pkg)
+    pkgs = sorted(pkgs, key=lambda p: p['id'])
+    for i in range(max_packages_in_state):
+        if i < len(pkgs):
+            pkg = pkgs[i]
+            sr, sc = pkg['start_pos']
+            tr, tc = pkg['target_pos']
+            deadline = pkg['deadline']
+            status = pkg['status']
+            # start pos (nếu waiting), target pos, deadline, status, carrier_id_norm
             if status == 'waiting':
-                # Channel: Waiting Packages' Start Positions
-                if CH_IDX_PKG_WAITING_START_POS < num_channels_out:
-                    if 0 <= start_pos[0] < n_rows and 0 <= start_pos[1] < n_cols: # Boundary check
-                        spatial_tensor[CH_IDX_PKG_WAITING_START_POS, start_pos[0], start_pos[1]] = 1.0
+                vec += [sr/n_rows, sc/n_cols]
+            else:
+                vec += [0.0, 0.0]
+            vec += [tr/n_rows, tc/n_cols]
+            vec += [max(0, deadline-t)/max_time_steps if max_time_steps > 0 else 0.0]
+            vec += [0.0 if status == 'waiting' else 1.0]
+            carrier_id_norm = -1.0
+            if status == 'in_transit':
+                for ridx, rdata in enumerate(env_state_dict['robots']):
+                    if rdata[2] == pkg['id']:
+                        carrier_id_norm = ridx/(max_robots_in_state-1) if max_robots_in_state > 1 else 0.0
+                        break
+            vec += [carrier_id_norm]
+        else:
+            vec += [0.0]*7
 
-                # Channel: Urgency of Waiting Packages
-                if CH_IDX_PKG_WAITING_URGENCY < num_channels_out:
-                    if 0 <= start_pos[0] < n_rows and 0 <= start_pos[1] < n_cols: # Boundary check
-                        urgency = 0.0
-                        if pkg_deadline > pkg_start_time: 
-                            urgency = min(1.0, max(0.0, (current_time - pkg_start_time) / (pkg_deadline - pkg_start_time)))
-                        elif pkg_deadline == pkg_start_time: 
-                            urgency = 1.0 # Deadline is now or passed if current_time >= pkg_start_time
-                        # Use max in case multiple packages share the same start_pos
-                        spatial_tensor[CH_IDX_PKG_WAITING_URGENCY, start_pos[0], start_pos[1]] = \
-                            max(spatial_tensor[CH_IDX_PKG_WAITING_URGENCY, start_pos[0], start_pos[1]], urgency)
+    # 3. Global time
+    vec.append(t/max_time_steps if max_time_steps > 0 else 0.0)
+    return global_map, np.array(vec, dtype=np.float32)
 
-                # Channel: Waiting Packages' Target Positions
-                if CH_IDX_PKG_WAITING_TARGET_POS < num_channels_out:
-                    if 0 <= target_pos[0] < n_rows and 0 <= target_pos[1] < n_cols: # Boundary check
-                        spatial_tensor[CH_IDX_PKG_WAITING_TARGET_POS, target_pos[0], target_pos[1]] = \
-                            max(spatial_tensor[CH_IDX_PKG_WAITING_TARGET_POS, target_pos[0], target_pos[1]], 1.0)
+
+class Args:
+    def __init__(self, config_path="QMIX/config.yaml"):
+        # Environment parameters
+        self.n_agents = 5                   # Number of agents in the environment
+        self.n_packages = 20                # Number of packages in the environment
+        self.max_time_steps_env = 100      # Maximum time steps per environment episode
+        self.render = False                  # Whether to render the environment
+        self.delivery_reward = 10          # Reward for delivering a package
+        self.delay_reward = 1             # Reward for delaying a package
+        self.move_cost = -0.01               # Cost for moving
+        self.map_file = "marl_delivery/map1.txt"
+
+        # Network architecture parameters
+        self.rnn_hidden_dim = 64            # Hidden dimension for the RNN in agent networks
+        self.mixing_embed_dim = 32          # Embedding dimension for the mixing network
+        self.hypernet_embed = 64            # Embedding dimension for the hypernetwork
+
+        # Optimization parameters
+        self.lr = 0.0005                    # Learning rate for the optimizer
+        self.optim_alpha = 0.99             # Alpha parameter for RMSprop optimizer
+        self.grad_norm_clip = 10            # Gradient norm clipping value
+
+        # Training and target update parameters
+        self.gamma = 0.99                   # Discount factor for future rewards
+        self.target_update_type = "hard"    # Type of target network update ("hard" or "soft")
+        self.target_update_interval = 200   # Interval (in steps) for hard target updates
+        self.tau = 0.005                    # Soft update coefficient (if using soft updates)
+        self.hard_target_update = True      # Whether to use hard target updates
+
+        # Replay buffer and training loop parameters
+        self.num_parallel_envs = 4          # Number of parallel environments for data collection
+        self.buffer_size = 1000             # Maximum size of the replay buffer
+        self.batch_size = 64              # Batch size for training
+        self.episode_limit = 1000            # Maximum steps per episode
+        self.min_timesteps_to_train = 1000  # Minimum timesteps before training starts
+        self.min_buffer_size_to_train = 50 # Minimum buffer size before training starts
+        self.max_training_iterations = 1000 # Maximum number of training iterations
+        self.max_total_timesteps = 500000   # Maximum total timesteps for training
+
+        # Exploration parameters
+        self.epsilon_start = 1.0            # Initial epsilon for epsilon-greedy exploration
+        self.epsilon_finish = 0.05          # Final epsilon value
+        self.epsilon_anneal_time = 500000   # Number of timesteps over which to anneal epsilon
+        self.use_epsilon_greedy = True      # Whether to use epsilon-greedy exploration
+
+        # Training step parameters
+        self.num_train_steps_per_iteration = 8 # Number of training steps per iteration
+
+        # Logging and saving
+        self.log_interval = 10              # Interval (in iterations) for logging
+        self.save_model_interval = 100      # Interval (in iterations) for saving the model
+
+        # Environment observation parameters
+        self.max_other_robots_to_observe = 4    # Max number of other robots each agent can observe
+        self.max_packages_to_observe = 5        # Max number of packages each agent can observe
+        self.max_robots_in_state = 10           # Max number of robots in the state representation
+        self.max_packages_in_state = 20         # Max number of packages in the state representation
+
+        # Miscellaneous
+        self.seed = 42                      # Random seed for reproducibility
+
+        # Model loading
+        self.load_model_path = None         # Path to load a pre-trained model (if any)
+        self.load_model_episode = 0         # Episode number to load the model from
             
-            elif status == 'in_transit':
-                # Channel: In-Transit Packages' Target Positions
-                if CH_IDX_PKG_IN_TRANSIT_TARGET_POS < num_channels_out:
-                    if 0 <= target_pos[0] < n_rows and 0 <= target_pos[1] < n_cols: # Boundary check
-                        spatial_tensor[CH_IDX_PKG_IN_TRANSIT_TARGET_POS, target_pos[0], target_pos[1]] = \
-                            max(spatial_tensor[CH_IDX_PKG_IN_TRANSIT_TARGET_POS, target_pos[0], target_pos[1]], 1.0)
-                
-    return spatial_tensor
-
-class AgentNetwork(nn.Module):
-    def __init__(self, observation_shape, action_dim, rnn_hidden_dim=64):
-        super(AgentNetwork, self).__init__()
-        # observation_shape is (C, H, W)
-        self.conv1 = nn.Conv2d(observation_shape[0], 16, kernel_size=3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(16)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(32)
-        self.conv3 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1)
-        self.bn3 = nn.BatchNorm2d(32)
-
-        conv_out_size = 32 * observation_shape[1] * observation_shape[2]  # 32 * H * W
-
-        self.rnn_hidden_dim = rnn_hidden_dim
-        self.rnn = nn.GRU(conv_out_size, rnn_hidden_dim, batch_first=False) # batch_first=False because hidden state is (1, N, H_out)
-
-        self.fc1 = nn.Linear(rnn_hidden_dim, 128)
-        self.fc2 = nn.Linear(128, action_dim)
-
-    def forward(self, obs, hidden_state):
-        # obs: (N, C, H, W) or (C, H, W)
-        # hidden_state: (1, N, rnn_hidden_dim) where N is batch size or 1 if single obs
+        self.use_cuda = torch.cuda.is_available()
         
-        # Handle single observation case by adding batch dimension
-        if obs.dim() == 3:
-            obs = obs.unsqueeze(0)  # (1, C, H, W)
-            # If obs was single, hidden_state should be (1, 1, rnn_hidden_dim)
-
-        N = obs.size(0) # Batch size
-
-        x = F.relu(self.bn1(self.conv1(obs)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
         
-        x = x.flatten(start_dim=1)  # (N, 32*H*W)
         
-        # Reshape for RNN: (seq_len, batch_size, input_size)
-        # Here, seq_len is 1
-        x_rnn_input = x.unsqueeze(0) # (1, N, 32*H*W)
-        
-        # Ensure hidden_state has the correct batch size N
-        # hidden_state should be (num_layers * num_directions, batch_size, rnn_hidden_dim)
-        # For GRU with num_layers=1, num_directions=1: (1, N, rnn_hidden_dim)
-        if hidden_state.size(1) != N:
-            # This might happen if a default hidden_state (e.g., for N=1) is passed with a batch (N > 1)
-            # Or if a batched hidden_state is passed with a single obs (N=1 after unsqueeze)
-            # For simplicity in train_step, we expect hidden_state to be correctly sized.
-            # For select_action, N will be 1.
-            raise ValueError(f"Mismatch in hidden_state batch size. Expected {N}, got {hidden_state.size(1)}")
+def save_qmix_model(actor, critic, path_prefix="models/qmix"):
+    abs_prefix = os.path.abspath(path_prefix)
+    dir_name = os.path.dirname(abs_prefix)
+    if not os.path.exists(dir_name):
+        os.makedirs(dir_name)
+    torch.save(actor.state_dict(), f"{abs_prefix}_agent.pt")
+    torch.save(critic.state_dict(), f"{abs_prefix}_mixer.pt")
+    print(f"QMIX models saved with prefix {path_prefix}")
+def load_qmix_model(actor, critic, path_prefix="models/qmix", device="cpu"):
+    actor_path = f"{path_prefix}_agent.pt"
+    critic_path = f"{path_prefix}_mixer.pt"
+    if os.path.exists(actor_path) and os.path.exists(critic_path):
+        actor.load_state_dict(torch.load(actor_path, map_location=device))
+        critic.load_state_dict(torch.load(critic_path, map_location=device))
+        print(f"QMIX models loaded from prefix {path_prefix}")
+        return True
+    print(f"Could not find QMIX models at prefix {path_prefix}")
+    return False
 
-        rnn_out, next_hidden_state = self.rnn(x_rnn_input, hidden_state)
-        
-        # rnn_out is (seq_len, batch_size, rnn_hidden_dim) -> (1, N, rnn_hidden_dim)
-        # We need (N, rnn_hidden_dim) for FC layer
-        rnn_out_squeezed = rnn_out.squeeze(0) # (N, rnn_hidden_dim)
-        
-        x = F.relu(self.fc1(rnn_out_squeezed))
-        q_values = self.fc2(x) # (N, action_dim)
-        
-        return q_values, next_hidden_state
-    
 
-class HyperNetwork(nn.Module):
-    def __init__(self, input_shape, output_dim, hidden_dim):
-        super().__init__()
-        # input_shape: (C, H, W)
-        self.conv1 = nn.Conv2d(input_shape[0], 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 16, kernel_size=3, padding=1)
-
-        flat_size = 16 * input_shape[1] * input_shape[2]
-        self.fc1 = nn.Linear(flat_size, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-
-        self.apply(self._init_weights)
-
-    @staticmethod
-    def _init_weights(m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.xavier_normal_(m.weight)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-
-    def forward(self, state):
-        # state: (B, C, H, W) or (C, H, W)
-        if state.dim() == 3:
-            state = state.unsqueeze(0)  # (1, C, H, W)
-        x = state  # (B, C, H, W)
-        x = F.relu(self.conv1(x))  # (B, 32, H, W)
-        x = F.relu(self.conv2(x))  # (B, 16, H, W)
-        x = x.flatten(start_dim=1)  # (B, 16*H*W)
-        x = F.relu(self.fc1(x))     # (B, hidden_dim)
-        weights = self.fc2(x)       # (B, output_dim)
-        return weights
-    
-    
-class MixingNetwork(nn.Module):
-    def __init__(self, state_dim, num_agents, mixing_dim):
-        super(MixingNetwork, self).__init__()
-        self.num_agents = num_agents
-        self.mixing_dim = mixing_dim
-
-        # state_dim: (C, H, W)
-        self.hyper_w1 = HyperNetwork(state_dim, num_agents * mixing_dim, 64)
-        self.hyper_b1 = HyperNetwork(state_dim, mixing_dim, 64)
-        self.hyper_w2 = HyperNetwork(state_dim, mixing_dim, 64)
-        self.hyper_b2 = HyperNetwork(state_dim, 1, 64)
-
-    def forward(self, agent_qs, states):
-        # agent_qs: (B, num_agents) or (num_agents,)
-        # states: (B, C, H, W) or (C, H, W)
-
-        # Ensure batch dimension for agent_qs
-        if agent_qs.dim() == 1:
-            agent_qs = agent_qs.unsqueeze(0)  # (1, num_agents)
-
-        batch_size = agent_qs.size(0)
-
-        # Ensure batch dimension for states
-        if states.dim() == 3:
-            states = states.unsqueeze(0)  # (1, C, H, W)
-
-        # agent_qs: (B, num_agents) -> (B, 1, num_agents)
-        agent_qs = agent_qs.view(batch_size, 1, self.num_agents)
-
-        # First layer weights and biases
-        w1 = torch.abs(self.hyper_w1(states))  # (B, num_agents * mixing_dim)
-        w1 = w1.view(batch_size, self.num_agents, self.mixing_dim)  # (B, num_agents, mixing_dim)
-        b1 = self.hyper_b1(states)  # (B, mixing_dim)
-        b1 = b1.view(batch_size, 1, self.mixing_dim)  # (B, 1, mixing_dim)
-
-        # Compute first layer output
-        hidden = F.elu(torch.bmm(agent_qs, w1) + b1)  # (B, 1, mixing_dim)
-
-        # Second layer weights and biases
-        w2 = torch.abs(self.hyper_w2(states))  # (B, mixing_dim)
-        w2 = w2.view(batch_size, self.mixing_dim, 1)  # (B, mixing_dim, 1)
-        b2 = self.hyper_b2(states)  # (B, 1)
-        b2 = b2.view(batch_size, 1, 1)  # (B, 1, 1)
-
-        # Compute final output
-        q_tot = torch.bmm(hidden, w2) + b2  # (B, 1, 1)
-        q_tot = q_tot.squeeze(-1).squeeze(-1)  # (B,)
-
-        return q_tot
-    
-    
-import numpy as np
-import torch
 
 class ReplayBuffer:
-    def __init__(self, capacity, num_agents, obs_shape, state_shape, device="cpu"):
+    def __init__(self, capacity, episode_limit, n_agents,
+                 spatial_obs_shape, vector_obs_dim,
+                 global_spatial_state_shape, global_vector_state_dim,
+                 n_actions, args):
         self.capacity = capacity
-        self.num_agents = num_agents
-        self.obs_shape = obs_shape  
-        self.state_shape = state_shape 
-        self.device = device
+        self.episode_limit = episode_limit
+        self.n_agents = n_agents
+        self.n_actions = n_actions
+        self.args = args
 
-        # Determine actual shapes for numpy arrays
-        _obs_s = (obs_shape,) if isinstance(obs_shape, int) else obs_shape
-        _state_s = (state_shape,) if isinstance(state_shape, int) else state_shape
+        # Shapes
+        self.spatial_obs_shape = spatial_obs_shape # (C_obs, H, W)
+        self.vector_obs_dim = vector_obs_dim
+        self.global_spatial_state_shape = global_spatial_state_shape # (C_global, H, W)
+        self.global_vector_state_dim = global_vector_state_dim
 
-        self.states = np.zeros((capacity, *_state_s), dtype=np.float32)
-        self.observations = np.zeros((capacity, num_agents, *_obs_s), dtype=np.float32)
-        self.actions = np.zeros((capacity, num_agents), dtype=np.int64)
-        self.individual_rewards = np.zeros((capacity, num_agents), dtype=np.float32)
-        self.next_states = np.zeros((capacity, *_state_s), dtype=np.float32)
-        self.next_observations = np.zeros((capacity, num_agents, *_obs_s), dtype=np.float32)
-        self.dones = np.zeros((capacity, 1), dtype=np.bool_) # Global done flag
-
-        self.ptr = 0
-        self.size = 0
+        # Initialize buffers
+        self.buffer_spatial_obs = np.zeros((capacity, episode_limit, n_agents, *spatial_obs_shape), dtype=np.float32)
+        self.buffer_vector_obs = np.zeros((capacity, episode_limit, n_agents, vector_obs_dim), dtype=np.float32)
         
-    def add(self, state, next_state, obs, next_obs, actions, individual_rewards, done):
-        """
-        Adds a transition to the buffer.
-        - state: np.array with shape self.state_shape
-        - obs: np.array with shape (self.num_agents, *self.obs_shape)
-        - actions: np.array with shape (self.num_agents,)
-        - individual_rewards: np.array shape (self.num_agents,) (per-agent rewards)
-        - next_state: np.array with shape self.state_shape
-        - next_obs: np.array with shape (self.num_agents, *self.obs_shape)
-        - done: bool or np.array shape (1,) (global done flag)
-        """
-        self.states[self.ptr] = state
-        self.observations[self.ptr] = obs
-        self.actions[self.ptr] = actions
-        self.individual_rewards[self.ptr] = individual_rewards
-        self.next_states[self.ptr] = next_state
-        self.next_observations[self.ptr] = next_obs
-        self.dones[self.ptr] = done # Expects global done
-
-        self.ptr = (self.ptr + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-
-
-    def sample(self, batch_size):
-        """
-        Samples a batch of transitions from the buffer.
-        """
-        if self.size == 0:
-            print("Warning: Buffer is empty. Returning empty tensors.")
-            _obs_s_runtime = (self.obs_shape,) if isinstance(self.obs_shape, int) else self.obs_shape
-            _state_s_runtime = (self.state_shape,) if isinstance(self.state_shape, int) else self.state_shape
-
-            empty_states = torch.empty((0, *_state_s_runtime), dtype=torch.float32, device=self.device)
-            empty_obs = torch.empty((0, self.num_agents, *_obs_s_runtime), dtype=torch.float32, device=self.device)
-            empty_actions = torch.empty((0, self.num_agents), dtype=torch.long, device=self.device)
-            empty_individual_rewards = torch.empty((0, self.num_agents), dtype=torch.float32, device=self.device)
-            empty_next_states = torch.empty((0, *_state_s_runtime), dtype=torch.float32, device=self.device)
-            empty_next_obs = torch.empty((0, self.num_agents, *_obs_s_runtime), dtype=torch.float32, device=self.device)
-            empty_dones = torch.empty((0, 1), dtype=torch.float32, device=self.device) # Global done
-            return (empty_states, empty_obs, empty_actions, empty_individual_rewards,
-                    empty_next_states, empty_next_obs, empty_dones)
-
-        if self.size < batch_size:
-            print(f"Warning: Buffer size ({self.size}) is less than batch size ({batch_size}). Sampling all available data.")
-            indices = np.arange(self.size)
-            current_batch_size = self.size
-        else:
-            indices = np.random.choice(self.size, batch_size, replace=False)
-
-        batch_states = torch.tensor(self.states[indices], dtype=torch.float32).to(self.device)
-        batch_obs = torch.tensor(self.observations[indices], dtype=torch.float32).to(self.device)
-        batch_actions = torch.tensor(self.actions[indices], dtype=torch.long).to(self.device)
-        batch_individual_rewards = torch.tensor(self.individual_rewards[indices], dtype=torch.float32).to(self.device)
-        batch_next_states = torch.tensor(self.next_states[indices], dtype=torch.float32).to(self.device)
-        batch_next_obs = torch.tensor(self.next_observations[indices], dtype=torch.float32).to(self.device)
-        batch_dones = torch.tensor(self.dones[indices], dtype=torch.float32).to(self.device) # bool to float
-
-        return (batch_states, batch_next_states, batch_obs, batch_next_obs, 
-                batch_actions, batch_individual_rewards, batch_dones)
+        self.buffer_global_spatial_state = np.zeros((capacity, episode_limit, *global_spatial_state_shape), dtype=np.float32)
+        self.buffer_global_vector_state = np.zeros((capacity, episode_limit, global_vector_state_dim), dtype=np.float32)
         
-    def can_sample(self, batch_size):
-        return self.size >= batch_size
+        self.buffer_actions = np.zeros((capacity, episode_limit, n_agents, 1), dtype=np.int64)
+        self.buffer_rewards = np.zeros((capacity, episode_limit, 1), dtype=np.float32) # Global reward
+        
+        self.buffer_next_spatial_obs = np.zeros((capacity, episode_limit, n_agents, *spatial_obs_shape), dtype=np.float32)
+        self.buffer_next_vector_obs = np.zeros((capacity, episode_limit, n_agents, vector_obs_dim), dtype=np.float32)
+
+        self.buffer_next_global_spatial_state = np.zeros((capacity, episode_limit, *global_spatial_state_shape), dtype=np.float32)
+        self.buffer_next_global_vector_state = np.zeros((capacity, episode_limit, global_vector_state_dim), dtype=np.float32)
+        
+        self.buffer_avail_actions = np.zeros((capacity, episode_limit, n_agents, n_actions), dtype=np.bool_)
+        self.buffer_next_avail_actions = np.zeros((capacity, episode_limit, n_agents, n_actions), dtype=np.bool_)
+        
+        self.buffer_terminated = np.zeros((capacity, episode_limit, 1), dtype=np.bool_)
+        # Padded is True if the step is beyond actual episode length
+        self.buffer_padded = np.ones((capacity, episode_limit, 1), dtype=np.bool_)
+        self.buffer_actual_episode_len = np.zeros((capacity,), dtype=np.int32)
+
+
+        self.current_size = 0
+        self.current_idx = 0
+
+    def add_episode_data(self, episode_transitions):
+        """
+        Thêm một episode hoàn chỉnh vào buffer.
+        episode_transitions: list các dictionary, mỗi dict chứa một transition.
+        Keys: "so", "vo", "gs", "gv", "u", "r", "so_next", "vo_next",
+              "gs_next", "gv_next", "avail_u", "avail_u_next", "terminated"
+        """
+        episode_len = len(episode_transitions)
+        if episode_len == 0 or episode_len > self.episode_limit:
+            print(f"Warning: Episode length {episode_len} is 0 or exceeds limit {self.episode_limit}. Skipping.")
+            return
+
+        idx = self.current_idx
+        self.buffer_actual_episode_len[idx] = episode_len
+
+        # Reset padding for this episode slot first
+        self.buffer_padded[idx] = True 
+
+        for t_idx, trans in enumerate(episode_transitions):
+            self.buffer_spatial_obs[idx, t_idx] = trans["so"]
+            self.buffer_vector_obs[idx, t_idx] = trans["vo"]
+            self.buffer_global_spatial_state[idx, t_idx] = trans["gs"]
+            self.buffer_global_vector_state[idx, t_idx] = trans["gv"]
+            self.buffer_actions[idx, t_idx] = trans["u"].reshape(self.n_agents, 1) # Ensure shape (N,1)
+            self.buffer_rewards[idx, t_idx] = trans["r"]
+            self.buffer_next_spatial_obs[idx, t_idx] = trans["so_next"]
+            self.buffer_next_vector_obs[idx, t_idx] = trans["vo_next"]
+            self.buffer_next_global_spatial_state[idx, t_idx] = trans["gs_next"]
+            self.buffer_next_global_vector_state[idx, t_idx] = trans["gv_next"]
+            self.buffer_avail_actions[idx, t_idx] = trans["avail_u"]
+            self.buffer_next_avail_actions[idx, t_idx] = trans["avail_u_next"]
+            self.buffer_terminated[idx, t_idx] = trans["terminated"]
+            self.buffer_padded[idx, t_idx] = False # Mark as not padded
+
+        self.current_idx = (self.current_idx + 1) % self.capacity
+        if self.current_size < self.capacity:
+            self.current_size += 1
+
+    def sample(self):
+        if self.current_size < self.args.batch_size:
+             raise ValueError(f"Replay buffer has {self.current_size} episodes, less than batch size {self.args.batch_size}. Cannot sample.")
+
+
+        indices = np.random.choice(self.current_size, self.args.batch_size, replace=False)
+        device = torch.device("cuda" if self.args.use_cuda else "cpu")
+
+        batch = {
+            'so': torch.tensor(self.buffer_spatial_obs[indices], dtype=torch.float32, device=device),
+            'vo': torch.tensor(self.buffer_vector_obs[indices], dtype=torch.float32, device=device),
+            'gs': torch.tensor(self.buffer_global_spatial_state[indices], dtype=torch.float32, device=device),
+            'gv': torch.tensor(self.buffer_global_vector_state[indices], dtype=torch.float32, device=device),
+            'u': torch.tensor(self.buffer_actions[indices], dtype=torch.long, device=device),
+            'r': torch.tensor(self.buffer_rewards[indices], dtype=torch.float32, device=device),
+            'so_next': torch.tensor(self.buffer_next_spatial_obs[indices], dtype=torch.float32, device=device),
+            'vo_next': torch.tensor(self.buffer_next_vector_obs[indices], dtype=torch.float32, device=device),
+            'gs_next': torch.tensor(self.buffer_next_global_spatial_state[indices], dtype=torch.float32, device=device),
+            'gv_next': torch.tensor(self.buffer_next_global_vector_state[indices], dtype=torch.float32, device=device),
+            'avail_u': torch.tensor(self.buffer_avail_actions[indices], dtype=torch.float32, device=device),
+            'avail_u_next': torch.tensor(self.buffer_next_avail_actions[indices], dtype=torch.float32, device=device),
+            'terminated': torch.tensor(self.buffer_terminated[indices], dtype=torch.float32, device=device),
+            'padded': torch.tensor(self.buffer_padded[indices], dtype=torch.float32, device=device)
+        }
+        return batch
+
+    def can_sample(self):
+        return self.current_size >= self.args.min_buffer_size_to_train and self.current_size >= self.args.batch_size
 
     def __len__(self):
-        return self.size
+        return self.current_size
+    
+    
+    
+    
+class RNNAgent(nn.Module):
+    """
+    Mạng Q-value cá nhân cho mỗi tác nhân, sử dụng RNN (GRUCell).
+    Đầu vào: quan sát cục bộ (và có thể là hành động trước đó, ID tác nhân).
+    Đầu ra: Q-values cho mỗi hành động có thể có của tác nhân.
+    """
+    def __init__(self, spatial_obs_shape, vector_obs_dim, rnn_hidden_dim, n_actions=15,
+                 cnn_channels_out=64, cnn_mlp_hidden_dim=128, vector_mlp_hidden_dim=128, args=None):
+        """
+        RNNAgent xử lý cả spatial và vector observations.
 
-import matplotlib.pyplot as plt
+        Args:
+            spatial_obs_shape (tuple): Shape của spatial observation (C, H, W).
+            vector_obs_dim (int): Dimension của vector observation.
+            rnn_hidden_dim (int): Kích thước lớp ẩn của GRU.
+            n_actions (int): Số lượng hành động.
+            cnn_channels_out (int): Số kênh đầu ra của lớp CNN cuối cùng.
+            cnn_mlp_hidden_dim (int): Kích thước lớp ẩn MLP sau CNN.
+            vector_mlp_hidden_dim (int): Kích thước lớp ẩn MLP cho vector obs.
+            args: Các tham số khác.
+        """
+        super(RNNAgent, self).__init__()
+        self.args = args
+        self.rnn_hidden_dim = rnn_hidden_dim
+        self.n_actions = n_actions
 
-# Define the linear epsilon function
-def linear_epsilon(steps_done):
-    return max(EPS_END, EPS_START - (EPS_START - EPS_END) * (steps_done / EPS_DECAY))
-
-# Define the corrected exponential epsilon function
-def exponential_epsilon(steps_done):
-    return EPS_END + (EPS_START - EPS_END) * np.exp(-steps_done / EPS_DECAY)
-
-# Recalculate epsilon values using the defined functions
-steps_done = np.arange(args.num_episodes)
-
-linear_epsilons = [linear_epsilon(step) for step in steps_done]
-exp_epsilons = [exponential_epsilon(step) for step in steps_done]
-
-
-
-try:
-    env = Environment(map_file=MAP_FILE,
-                  n_robots=NUM_AGENTS, 
-                  n_packages=N_PACKAGES,
-                  move_cost=MOVE_COST,
-                  delivery_reward=DELIVERY_REWARD,
-                  delay_reward=DELAY_REWARD,
-                  seed=SEED,
-                  max_time_steps=MAX_TIME_STEPS)
-except:
-    env = Environment(map_file=f"marl_delivery/{MAP_FILE}",
-                  n_robots=NUM_AGENTS, 
-                  n_packages=N_PACKAGES,
-                  move_cost=MOVE_COST,
-                  delivery_reward=DELIVERY_REWARD,
-                  delay_reward=DELAY_REWARD,
-                  seed=SEED,
-                  max_time_steps=MAX_TIME_STEPS)
-env.reset()
-
-state_dict_sample = env.reset()
-
-# Xây dựng persistent_packages từ state_dict['packages'] (chỉ làm điều này một lần khi gói hàng xuất hiện)
-# Hoặc bạn có cơ chế riêng để quản lý persistent_packages
-persistent_packages_sample = {}
-if state_dict_sample['time_step'] == 0 and 'packages' in state_dict_sample:
-    for pkg_tuple in state_dict_sample['packages']:
-        pkg_id, sr_1, sc_1, tr_1, tc_1, st, dl = pkg_tuple
-        persistent_packages_sample[pkg_id] = {
-            'id': pkg_id,
-            'start_pos': (sr_1 - 1, sc_1 - 1), # 0-indexed
-            'target_pos': (tr_1 - 1, tc_1 - 1), # 0-indexed
-            'start_time': st,
-            'deadline': dl,
-            'status': 'waiting' # Trạng thái ban đầu
-        }
-
-# Kiểm tra xem có robot nào đang mang gói hàng không để cập nhật status trong persistent_packages
-# (Logic này thường nằm trong vòng lặp chính của môi trường/agent)
-for r_data in state_dict_sample['robots']:
-    carried_id = r_data[2]
-    if carried_id != 0 and carried_id in persistent_packages_sample:
-        persistent_packages_sample[carried_id]['status'] = 'in_transit'
+        # --- CNN Branch for Spatial Observations ---
+        self.spatial_channels_in = spatial_obs_shape[0]
+        # Giả sử kernel_size=3, stride=1, padding=1 không thay đổi kích thước H, W đáng kể
+        # Hoặc sử dụng AdaptiveAvgPool2d để có kích thước cố định
+        self.conv1 = nn.Conv2d(self.spatial_channels_in, 32, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, cnn_channels_out, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(cnn_channels_out)
+        # self.conv3 = nn.Conv2d(64, cnn_channels_out, kernel_size=3, stride=1, padding=1)
+        # self.bn3 = nn.BatchNorm2d(cnn_channels_out)
+        
+        # Sử dụng AdaptiveAvgPool2d để có kích thước đầu ra cố định từ CNN
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4)) # Ví dụ: output 4x4
+        self.cnn_flattened_dim = cnn_channels_out * 4 * 4
+        self.cnn_fc = nn.Linear(self.cnn_flattened_dim, cnn_mlp_hidden_dim)
 
 
-desired_shape = (7, 10, 10) # (channels, height, width)
-max_t = 1000
+        # --- MLP Branch for Vector Observations ---
+        self.vector_fc1 = nn.Linear(vector_obs_dim, vector_mlp_hidden_dim)
+        # self.vector_fc2 = nn.Linear(vector_mlp_hidden_dim, vector_mlp_hidden_dim // 2)
 
-global_state_tensor = convert_state(
-    state_dict_sample,
-    persistent_packages_sample, # Sử dụng persistent_packages đã được xây dựng
-    desired_shape,
-)
+        # --- Combined Features to GRU ---
+        # combined_input_dim = self.cnn_flattened_dim + (vector_mlp_hidden_dim // 2)
+        combined_input_dim = cnn_mlp_hidden_dim + vector_mlp_hidden_dim
+        
+        self.rnn = nn.GRUCell(combined_input_dim, rnn_hidden_dim)
+        self.fc_q = nn.Linear(rnn_hidden_dim, n_actions) # Output Q-values
 
-# Tên các kênh để hiển thị (dựa trên logic của hàm convert_state)
-channel_names = [
-    "0: Map Obstacles",
-    "1: Robot Positions",
-    "2: Robot Carrying Status",
-    "3: Pkg Waiting Start Pos",
-    "4: Pkg Waiting Target Pos",
-    "5: Pkg In-Transit Target Pos",
-    "6: Pkg Waiting Urgency",
-]
+    def init_hidden(self):
+        # Khởi tạo trạng thái ẩn cho RNN (trên cùng thiết bị với model)
+        return self.conv1.weight.new(1, self.rnn_hidden_dim).zero_()
 
-num_channels_to_plot = global_state_tensor.shape[0]
+    def forward(self, spatial_obs, vector_obs, hidden_state):
+        # spatial_obs: (batch_size, C, H, W)
+        # vector_obs: (batch_size, vector_obs_dim)
+        # hidden_state shape: (batch_size, rnn_hidden_dim)
 
-# Tính toán số hàng và cột cho subplot
-# Ví dụ: cho 8 kênh, có thể dùng 2 hàng x 4 cột hoặc 3 hàng x 3 cột
-n_rows_plot = (num_channels_to_plot + 3) // 4 if num_channels_to_plot > 4 else 1 # Tối đa 4 cột
-if num_channels_to_plot <= 4: n_rows_plot = 1
-elif num_channels_to_plot <= 8: n_rows_plot = 2
-else: n_rows_plot = (num_channels_to_plot + 2) // 3 # Cho nhiều hơn 8 kênh, dùng 3 cột
+        # CNN path
+        x_spatial = F.relu(self.bn1(self.conv1(spatial_obs)))
+        x_spatial = F.relu(self.bn2(self.conv2(x_spatial)))
+        # x_spatial = F.relu(self.bn3(self.conv3(x_spatial))) # Nếu có conv3
+        x_spatial = self.adaptive_pool(x_spatial)
+        x_spatial_flat = x_spatial.reshape(x_spatial.size(0), -1)
+        x_spatial_processed = F.relu(self.cnn_fc(x_spatial_flat))
 
-n_cols_plot = min(num_channels_to_plot, 4 if num_channels_to_plot > 4 and num_channels_to_plot <=8 else 3)
-if num_channels_to_plot <= 4: n_cols_plot = num_channels_to_plot
+        # Vector MLP path
+        x_vector_processed = F.relu(self.vector_fc1(vector_obs))
+        # x_vector_processed = F.relu(self.vector_fc2(x_vector)) # Nếu có vector_fc2
 
+        # Concatenate processed features
+        combined_features = torch.cat((x_spatial_processed, x_vector_processed), dim=1)
 
+        # GRU
+        h_in = hidden_state.reshape(-1, self.rnn_hidden_dim)
+        h = self.rnn(combined_features, h_in)
+        
+        q_values = self.fc_q(h)
+        return q_values, h
 
+class QMixer(nn.Module):
+    """
+    Mạng Trộn QMIX.
+    Kết hợp Q-values từ các tác nhân cá nhân thành Q_tot.
+    Sử dụng hypernetworks để tạo trọng số và bias cho mạng trộn,
+    đảm bảo tính đơn điệu (monotonicity).
+    """
+    def __init__(self, n_agents, 
+                 global_spatial_state_shape, global_vector_state_dim, 
+                 mixing_embed_dim, 
+                 cnn_channels_out=64, cnn_mlp_hidden_dim=128, 
+                 vector_mlp_hidden_dim=128, hypernet_embed=64, args=None):
+        super(QMixer, self).__init__()
+        self.args = args
+        self.n_agents = n_agents
+        self.mixing_embed_dim = mixing_embed_dim # Kích thước embedding cho Q-values trong mạng trộn
+        self.hypernet_embed = hypernet_embed  # Store for use in hypernet layers
 
+        # --- Processor for Global State (Spatial + Vector) ---
+        self.global_spatial_channels_in = global_spatial_state_shape[0]
+        self.state_conv1 = nn.Conv2d(self.global_spatial_channels_in, 32, kernel_size=3, stride=1, padding=1)
+        self.state_bn1 = nn.BatchNorm2d(32)
+        self.state_conv2 = nn.Conv2d(32, cnn_channels_out, kernel_size=3, stride=1, padding=1)
+        self.state_bn2 = nn.BatchNorm2d(cnn_channels_out)
+        self.state_adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))
+        self.state_cnn_flattened_dim = cnn_channels_out * 4 * 4
+        self.state_cnn_fc = nn.Linear(self.state_cnn_flattened_dim, cnn_mlp_hidden_dim)
 
-def reward_shaping(
-    prev_env_state,
-    current_env_state,
-    actions_taken,
-    persistent_packages_before_action,
-    num_agents
+        self.state_vector_fc1 = nn.Linear(global_vector_state_dim, vector_mlp_hidden_dim)
+        
+        # Kích thước của state sau khi xử lý, dùng làm đầu vào cho hypernetworks
+        self.processed_state_dim = cnn_mlp_hidden_dim + vector_mlp_hidden_dim
+
+        # Hypernetwork cho trọng số của lớp trộn thứ nhất
+        self.hyper_w1 = nn.Sequential(
+            nn.Linear(self.processed_state_dim, self.hypernet_embed),
+            nn.ReLU(),
+            nn.Linear(self.hypernet_embed, self.n_agents * self.mixing_embed_dim)
+        )
+        # Hypernetwork cho bias của lớp trộn thứ nhất
+        self.hyper_b1 = nn.Linear(self.processed_state_dim, self.mixing_embed_dim)
+
+        # Hypernetwork cho trọng số của lớp trộn thứ hai
+        self.hyper_w2 = nn.Sequential(
+            nn.Linear(self.processed_state_dim, self.hypernet_embed),
+            nn.ReLU(),
+            nn.Linear(self.hypernet_embed, self.mixing_embed_dim) # w2 là vector, không phải ma trận
+        )
+        # Hypernetwork cho bias của lớp trộn thứ hai (scalar cho Q_tot)
+        self.hyper_b2 = nn.Sequential(
+            nn.Linear(self.processed_state_dim, self.mixing_embed_dim), # Lớp trung gian
+            nn.ReLU(),
+            nn.Linear(self.mixing_embed_dim, 1)
+        )
+
+    def forward(self, agent_qs, global_spatial_state, global_vector_state):
+        # agent_qs: Q-values của các tác nhân, shape (batch_size, seq_len, n_agents) hoặc (batch_size, n_agents)
+        # global_spatial_state: (batch_size, seq_len, C_global, H, W) hoặc (batch_size, C_global, H, W)
+        # global_vector_state: (batch_size, seq_len, global_vector_dim) hoặc (batch_size, global_vector_dim)
+
+        original_shape_qs = agent_qs.shape
+        bs = original_shape_qs[0]
+        seq_len = 1
+        if len(original_shape_qs) == 3: # (bs, seq_len, N)
+            seq_len = original_shape_qs[1]
+            agent_qs = agent_qs.reshape(bs * seq_len, self.n_agents)
+            current_c_global = self.global_spatial_state_shape[0]
+            current_h_global = self.global_spatial_state_shape[1]
+            current_w_global = self.global_spatial_state_shape[2]
+            global_spatial_state = global_spatial_state.reshape(bs * seq_len, current_c_global, current_h_global, current_w_global)
+            global_vector_state = global_vector_state.reshape(bs * seq_len, self.global_vector_state_dim)
+
+        s_spatial = global_spatial_state
+        s_vector = global_vector_state
+
+        s_spatial_proc = F.relu(self.state_bn1(self.state_conv1(s_spatial)))
+        s_spatial_proc = F.relu(self.state_bn2(self.state_conv2(s_spatial_proc)))
+        s_spatial_proc = self.state_adaptive_pool(s_spatial_proc)
+        s_spatial_flat = s_spatial_proc.reshape(s_spatial_proc.size(0), -1)
+        s_spatial_out = F.relu(self.state_cnn_fc(s_spatial_flat))
+        s_vector_out = F.relu(self.state_vector_fc1(s_vector))
+        processed_state = torch.cat((s_spatial_out, s_vector_out), dim=1)
+
+        # Lớp trộn thứ nhất
+        w1_val = self.hyper_w1(processed_state)
+        w1 = torch.abs(w1_val).view(-1, self.n_agents, self.mixing_embed_dim)
+
+        b1_val = self.hyper_b1(processed_state)
+        b1 = b1_val.view(-1, 1, self.mixing_embed_dim)
+
+        agent_qs_reshaped = agent_qs.unsqueeze(1)
+
+        # Perform BMM1
+        hidden_bmm1_out = torch.bmm(agent_qs_reshaped, w1)
+        hidden = F.elu(hidden_bmm1_out + b1)
+
+        # Lớp trộn thứ hai
+        w2_val = self.hyper_w2(processed_state)
+        w2 = torch.abs(w2_val).view(-1, self.mixing_embed_dim, 1)
+
+        b2 = self.hyper_b2(processed_state)
+
+        # Perform BMM2
+        q_total_bmm2_out = torch.bmm(hidden, w2)
+        
+        # Corrected addition using unsqueeze to ensure proper broadcasting
+        q_total_before_squeeze = q_total_bmm2_out + b2.unsqueeze(1) 
+        
+        q_total = q_total_before_squeeze.squeeze(-1)
+
+        if len(original_shape_qs) == 3:
+            q_total = q_total.view(bs, seq_len, 1)
+        else:
+            q_total = q_total.view(bs, 1)
+            
+        return q_total
+    
+    
+    
+    
+def compute_shaped_rewards(
+    global_reward,
+    prev_env_state_dict,
+    current_env_state_dict,
+    actions_taken_for_all_agents,
+    persistent_packages_at_prev_state,
+    num_agents,
 ):
     """
-    Compute shaped rewards for each agent using both base and A*-potential-based shaping.
+    Computes shaped rewards for each agent based on transitions and intended actions.
+    Returns: tổng shaped reward (float), và shaped reward từng agent (np.array)
     """
-    # --- Constants ---
-    SHAPING_SUCCESSFUL_PICKUP_BONUS = 10
-    SHAPING_SUCCESSFUL_DELIVERY_BONUS = 100
-    SHAPING_LATE_DELIVERY_PENALTY = -50
-    SHAPING_WASTED_PICKUP_PENALTY = -0.01
-    SHAPING_WASTED_DROP_PENALTY = 0
-    SHAPING_STAY_PENALTY = -0.01
-    MOVE_COST = -0.01
+    # --- Shaping Constants ---
+    SHAPING_SUCCESSFUL_PICKUP = 0.5
+    SHAPING_SUCCESSFUL_DELIVERY_ON_TIME = 2.0
+    SHAPING_SUCCESSFUL_DELIVERY_LATE = 0.2
+    SHAPING_MOVED_CLOSER_TO_TARGET = 0.02
+    SHAPING_WASTED_PICKUP_ATTEMPT = -0.1
+    SHAPING_WASTED_DROP_ATTEMPT = -0.1
+    SHAPING_COLLISION_OR_STUCK = -0.05
+    SHAPING_IDLE_WITH_AVAILABLE_TASKS = -0.02
+    SHAPING_MOVED_AWAY_FROM_TARGET = -0.02
 
+    shaped_rewards = np.zeros(num_agents, dtype=np.float32)
+    current_time = int(current_env_state_dict['time_step'])
 
-    individual_rewards = [MOVE_COST] * num_agents
+    def manhattan_distance(pos1, pos2):
+        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
 
-    current_time_from_env = current_env_state['time_step']
-    if isinstance(current_time_from_env, np.ndarray):
-        current_time_from_env = current_time_from_env[0]
+    for agent_idx in range(num_agents):
+        prev_r, prev_c, prev_pkg = [int(x) for x in prev_env_state_dict['robots'][agent_idx]]
+        curr_r, curr_c, curr_pkg = [int(x) for x in current_env_state_dict['robots'][agent_idx]]
+        prev_r -= 1; prev_c -= 1; curr_r -= 1; curr_c -= 1
+        move_str, pkg_op_str = actions_taken_for_all_agents[agent_idx]
+        pkg_op = int(pkg_op_str)
 
-    time_at_prev_state = prev_env_state.get('time_step', current_time_from_env - 1)
-    if isinstance(time_at_prev_state, np.ndarray):
-        time_at_prev_state = time_at_prev_state[0]
+        # 1. Nhặt/thả thành công
+        if prev_pkg == 0 and curr_pkg != 0:
+            shaped_rewards[agent_idx] += SHAPING_SUCCESSFUL_PICKUP
+        elif prev_pkg != 0 and curr_pkg == 0:
+            dropped_pkg = prev_pkg
+            if dropped_pkg in persistent_packages_at_prev_state:
+                pkg_info = persistent_packages_at_prev_state[dropped_pkg]
+                if (curr_r, curr_c) == pkg_info['target_pos']:
+                    if current_time <= pkg_info['deadline']:
+                        shaped_rewards[agent_idx] += SHAPING_SUCCESSFUL_DELIVERY_ON_TIME
+                    else:
+                        shaped_rewards[agent_idx] += SHAPING_SUCCESSFUL_DELIVERY_LATE
 
-    map_grid = np.array(current_env_state["map"])
+        # 2. Phạt hành động lãng phí
+        if pkg_op == 1:  # Pick
+            if prev_pkg != 0:
+                shaped_rewards[agent_idx] += SHAPING_WASTED_PICKUP_ATTEMPT
+            elif curr_pkg == 0:
+                can_pickup = any(
+                    pkg['status'] == 'waiting' and
+                    pkg['start_time'] <= prev_env_state_dict['time_step'] and
+                    pkg['start_pos'] == (curr_r, curr_c)
+                    for pkg in persistent_packages_at_prev_state.values()
+                )
+                if not can_pickup:
+                    shaped_rewards[agent_idx] += SHAPING_WASTED_PICKUP_ATTEMPT
+        elif pkg_op == 2:  # Drop
+            if prev_pkg == 0:
+                shaped_rewards[agent_idx] += SHAPING_WASTED_DROP_ATTEMPT
+            elif curr_pkg != 0:
+                if prev_pkg in persistent_packages_at_prev_state:
+                    pkg_info = persistent_packages_at_prev_state[prev_pkg]
+                    if (curr_r, curr_c) != pkg_info['target_pos']:
+                        shaped_rewards[agent_idx] += SHAPING_WASTED_DROP_ATTEMPT
 
-    for i in range(num_agents):
-        agent_action = actions_taken[i]
-        package_op = int(agent_action[1])  # 0: None, 1: Pick, 2: Drop
+        # 3. Di chuyển
+        moved = (prev_r, prev_c) != (curr_r, curr_c)
+        intended_move = move_str != 'S'
+        if intended_move and not moved:
+            shaped_rewards[agent_idx] += SHAPING_COLLISION_OR_STUCK
 
-        prev_robot_info = prev_env_state['robots'][i]
-        current_robot_info = current_env_state['robots'][i]
-
-        robot_prev_pos_0idx = (prev_robot_info[0] - 1, prev_robot_info[1] - 1)
-        robot_current_pos_0idx = (current_robot_info[0] - 1, current_robot_info[1] - 1)
-
-        # Penalty for staying in place if there are waiting packages
-        waiting_packages_exist = any(
-            pkg['status'] == 'waiting' and pkg['start_time'] <= time_at_prev_state
-            for pkg in persistent_packages_before_action.values()
-        )
-        if robot_prev_pos_0idx == robot_current_pos_0idx and waiting_packages_exist:
-            individual_rewards[i] += SHAPING_STAY_PENALTY
-        elif robot_prev_pos_0idx == robot_current_pos_0idx and not waiting_packages_exist:
-            individual_rewards[i] -= MOVE_COST  # cancel out move cost if no work to do
-
-        if i >= len(prev_env_state['robots']) or i >= len(current_env_state['robots']):
-            continue
-
-        prev_carrying_id = prev_robot_info[2]
-        current_carrying_id = current_robot_info[2]
-
-
-        # --- Base Reward Shaping ---
-        # 1. Shaping for PICKUP attempts
-        if package_op == 1:
-            if prev_carrying_id == 0 and current_carrying_id != 0:
-                # Successfully picked up a package
-                individual_rewards[i] += SHAPING_SUCCESSFUL_PICKUP_BONUS
-            elif prev_carrying_id != 0:
-                # Tried to pick up while already carrying
-                individual_rewards[i] += SHAPING_WASTED_PICKUP_PENALTY
-            elif prev_carrying_id == 0 and current_carrying_id == 0:
-                # Attempted pickup but failed (still not carrying).
-                package_was_available_and_waiting = False
-                for pkg_id, pkg_data in persistent_packages_before_action.items():
-                    if pkg_data['status'] == 'waiting' and \
-                       pkg_data['start_pos'] == robot_prev_pos_0idx and \
-                       pkg_data['start_time'] <= time_at_prev_state:
-                        package_was_available_and_waiting = True
-                        break
-                if not package_was_available_and_waiting:
-                    individual_rewards[i] += SHAPING_WASTED_PICKUP_PENALTY
-
-        # 2. Shaping for DROP attempts
-        elif package_op == 2:
-            if prev_carrying_id != 0 and current_carrying_id == 0:
-                dropped_pkg_id = prev_carrying_id
-                if dropped_pkg_id in persistent_packages_before_action:
-                    pkg_info = persistent_packages_before_action[dropped_pkg_id]
-                    pkg_target_pos_0idx = pkg_info['target_pos']
-                    pkg_deadline = pkg_info['deadline']
-                    if robot_current_pos_0idx == pkg_target_pos_0idx:
-                        individual_rewards[i] += SHAPING_SUCCESSFUL_DELIVERY_BONUS
-                        if current_time_from_env > pkg_deadline:
-                            individual_rewards[i] += SHAPING_LATE_DELIVERY_PENALTY
-                # else: dropped a package not in persistent_packages_before_action (should not happen)
-            elif prev_carrying_id == 0:
-                # Tried to drop when not carrying anything
-                individual_rewards[i] += SHAPING_WASTED_DROP_PENALTY
-
-    return individual_rewards
-
-
-
-
-class QMixTrainer:
-    def __init__(self, env, lr=LR, weight_decay=WEIGHT_DECAY, 
-                 gamma=GAMMA, tau=TAU, 
-                 gradient_clipping=GRADIENT_CLIPPING,
-                 rnn_hidden_dim=RNN_HIDDEN_DIM, # Added rnn_hidden_dim
-                use_data_parallel=True):
-        self.env = env
-        self.OBS_DIM = (6, env.n_rows, env.n_cols ) 
-        self.STATE_DIM = (7, env.n_rows, env.n_cols) 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.use_data_parallel = use_data_parallel
-        self.rnn_hidden_dim = rnn_hidden_dim
-
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.gamma = gamma
-        self.tau = tau
-        self.gradient_clipping = gradient_clipping
-        
-        # Persistent packages to track the package id and the target position
-        self.persistent_packages = {}
-        
-        # Initialize LabelEncoders for actions
-        self.le_move = LabelEncoder()
-        self.le_move.fit(['S', 'L', 'R', 'U', 'D']) # Stay, Left, Right, Up, Down
-        self.le_pkg_op = LabelEncoder()
-        self.le_pkg_op.fit(['0', '1', '2']) # 0: None, 1: Pickup, 2: Drop
-        self.NUM_MOVE_ACTIONS = len(self.le_move.classes_) # 5
-        self.NUM_PKG_OPS = len(self.le_pkg_op.classes_) # 3
-        self.ACTION_DIM = self.NUM_MOVE_ACTIONS * self.NUM_PKG_OPS
-        
-        # Network
-        self.agent_network = AgentNetwork(self.OBS_DIM, self.ACTION_DIM, self.rnn_hidden_dim).to(self.device)
-        self.mixing_network = MixingNetwork(self.STATE_DIM, NUM_AGENTS, MIXING_DIM).to(self.device)
-        
-        # Target networks
-        self.target_agent_network = AgentNetwork(self.OBS_DIM, self.ACTION_DIM, self.rnn_hidden_dim).to(self.device)
-        self.target_agent_network.load_state_dict(self.agent_network.state_dict())
-        self.target_mixing_network = MixingNetwork(self.STATE_DIM, NUM_AGENTS, MIXING_DIM).to(self.device)
-        self.target_mixing_network.load_state_dict(self.mixing_network.state_dict())
-
-        # Parallelization
-        self.agent_network = nn.DataParallel(self.agent_network)
-        self.mixing_network = nn.DataParallel(self.mixing_network)
-        self.target_agent_network = nn.DataParallel(self.target_agent_network)
-        self.target_mixing_network = nn.DataParallel(self.target_mixing_network)
-
-        if self.use_data_parallel:
-            self.target_agent_network.module.load_state_dict(self.agent_network.module.state_dict())
-            self.target_mixing_network.module.load_state_dict(self.mixing_network.module.state_dict())
+        # Tính mục tiêu di chuyển
+        target_pos = None
+        if prev_pkg != 0 and prev_pkg in persistent_packages_at_prev_state:
+            target_pos = persistent_packages_at_prev_state[prev_pkg]['target_pos']
         else:
-            self.target_agent_network.load_state_dict(self.agent_network.state_dict())
-            self.target_mixing_network.load_state_dict(self.mixing_network.state_dict())
+            # Gói waiting gần nhất
+            waiting_pkgs = [
+                pkg for pkg in persistent_packages_at_prev_state.values()
+                if pkg['status'] == 'waiting' and pkg['start_time'] <= prev_env_state_dict['time_step']
+            ]
+            if waiting_pkgs:
+                target_pos = min(
+                    (pkg['start_pos'] for pkg in waiting_pkgs),
+                    key=lambda pos: manhattan_distance((prev_r, prev_c), pos)
+                )
+        if target_pos and moved:
+            dist_before = manhattan_distance((prev_r, prev_c), target_pos)
+            dist_after = manhattan_distance((curr_r, curr_c), target_pos)
+            if dist_after < dist_before:
+                shaped_rewards[agent_idx] += SHAPING_MOVED_CLOSER_TO_TARGET
+            elif dist_after > dist_before:
+                shaped_rewards[agent_idx] += SHAPING_MOVED_AWAY_FROM_TARGET
 
-        if self.use_data_parallel:
-            self.agent_optimizer = optim.RMSprop(self.agent_network.module.parameters(), lr=self.lr)
-            self.mixing_optimizer = optim.RMSprop(self.mixing_network.module.parameters(), lr=self.lr)
+        # 4. Phạt đứng yên không cần thiết
+        if not moved and move_str == 'S' and prev_pkg == 0:
+            idle_nearby = any(
+                pkg['status'] == 'waiting' and
+                pkg['start_time'] <= prev_env_state_dict['time_step'] and
+                manhattan_distance((prev_r, prev_c), pkg['start_pos']) <= 3
+                for pkg in persistent_packages_at_prev_state.values()
+            )
+            if idle_nearby:
+                shaped_rewards[agent_idx] += SHAPING_IDLE_WITH_AVAILABLE_TASKS
+
+    return global_reward + shaped_rewards.sum()
+
+
+
+
+
+# QMIX/vectorized_env.py
+class VectorizedEnv:
+    def __init__(self, env_cls, num_envs, **env_kwargs):
+        base_seed = env_kwargs.get('seed', None)
+        self.envs = []
+        for idx in range(num_envs):
+            env_args = env_kwargs.copy()
+            if base_seed is not None:
+                env_args['seed'] = base_seed + idx
+            self.envs.append(env_cls(**env_args))
+        self.num_envs = num_envs
+
+    def reset(self, indices=None):
+        """
+        Reset all environments or a subset specified by indices.
+        Returns a list of observations (for all or selected envs).
+        """
+        if indices is None:
+            return [env.reset() for env in self.envs]
         else:
-            self.agent_optimizer = optim.RMSprop(self.agent_network.parameters(), lr=self.lr)
-            self.mixing_optimizer = optim.RMSprop(self.mixing_network.parameters(), lr=self.lr)
+            return [self.envs[i].reset() for i in indices]
 
-        self.buffer = ReplayBuffer(capacity=MAX_REPLAY_BUFFER_SIZE, 
-                                   num_agents=NUM_AGENTS, 
-                                   obs_shape=self.OBS_DIM, 
-                                   state_shape=self.STATE_DIM, 
-                                   device=self.device)
+    def step(self, actions, indices=None):
+        """
+        Step all environments or a subset specified by indices.
+        - actions: list of actions (for all envs or for selected indices)
+        - indices: list of indices to step (optional)
+        Returns: list of (next_state, reward, done, info) for each stepped env.
+        """
+        if indices is None:
+            # Step all envs
+            results = [env.step(action) for env, action in zip(self.envs, actions)]
+        else:
+            # Step only selected envs
+            results = [self.envs[i].step(action) for i, action in zip(indices, actions)]
+        next_states, rewards, dones, infos = zip(*results)
+        return list(next_states), list(rewards), list(dones), list(infos)
 
-        self.update_targets(1.0)  # Hard update at start
+    def render(self, indices=None):
+        """
+        Render all environments or a subset specified by indices.
+        """
+        if indices is None:
+            for env in self.envs:
+                env.render_pygame()
+        else:
+            for i in indices:
+                self.envs[i].render_pygame()
+                
+                
+                
+                
+                
+                
+class QMixLearner:
+    def __init__(self, n_agents, action_dim, args: Args,
+                 vec_env: VectorizedEnv, replay_buffer: ReplayBuffer,
+                 le_move: LabelEncoder, le_pkg_op: LabelEncoder):
+        self.args = args
+        self.n_agents = n_agents
+        self.action_dim = action_dim
+        self.device = device
 
+        self.vec_env = vec_env
+        self.replay_buffer = replay_buffer
+        self.le_move = le_move
+        self.le_pkg_op = le_pkg_op
+
+        # --- Initialize Networks ---
+        self.agent_net = RNNAgent(
+            args.spatial_obs_shape, args.vector_obs_dim, args.rnn_hidden_dim
+        ).to(self.device)
+        self.mixer_net = QMixer(
+            self.n_agents, args.global_spatial_state_shape, args.global_vector_state_dim, args.mixing_embed_dim,
+            hypernet_embed=args.hypernet_embed
+        ).to(self.device)
+
+        self.target_agent_net = RNNAgent(
+            args.spatial_obs_shape, args.vector_obs_dim, args.rnn_hidden_dim
+        ).to(self.device)
+        self.target_mixer_net = QMixer(
+            self.n_agents, args.global_spatial_state_shape, args.global_vector_state_dim, args.mixing_embed_dim
+        ).to(self.device)
+
+        self.update_target_networks(hard_update=True)
+
+        # --- Optimizer ---
+        # Combine parameters from agent and mixer networks for a single optimizer
+        params = list(self.agent_net.parameters()) + list(self.mixer_net.parameters())
+        self.optimizer = optim.RMSprop(params, lr=args.lr, alpha=args.optim_alpha)
         
-    def _update_persistent_packages(self, current_env_state): 
-        """
-        Updates self.persistent_packages based on the current environment state.
-        - current_env_state: The state dictionary from env.step() or env.reset().
-        """
-        # 1. Add newly appeared packages to persistent_packages if not already tracked
-        if 'packages' in current_env_state and current_env_state['packages'] is not None:
-            for pkg_tuple in current_env_state['packages']:
+        self.train_step_counter = 0 # To track when to update target networks
+
+        # State for data collection
+        self.current_env_states_list = None
+        self.persistent_packages_list = [{} for _ in range(self.args.num_parallel_envs)]
+        self.current_agent_hidden_states_list = None
+
+    def _update_persistent_packages_for_env(self, env_idx, current_env_state_dict):
+        current_persistent_packages = self.persistent_packages_list[env_idx]
+        
+        if 'packages' in current_env_state_dict and current_env_state_dict['packages'] is not None:
+            for pkg_tuple in current_env_state_dict['packages']:
                 pkg_id = pkg_tuple[0]
-                if pkg_id not in self.persistent_packages:
-                    self.persistent_packages[pkg_id] = {
+                if pkg_id not in current_persistent_packages:
+                    current_persistent_packages[pkg_id] = {
                         'id': pkg_id,
                         'start_pos': (pkg_tuple[1] - 1, pkg_tuple[2] - 1),
                         'target_pos': (pkg_tuple[3] - 1, pkg_tuple[4] - 1),
@@ -812,304 +913,459 @@ class QMixTrainer:
                         'status': 'waiting'
                     }
 
-        # 2. Get current robot carrying info
         current_carried_pkg_ids_set = set()
-        if 'robots' in current_env_state and current_env_state['robots'] is not None:
-            for r_idx, r_data in enumerate(current_env_state['robots']):
-                carried_id = r_data[2] # (pos_x+1, pos_y+1, carrying_package_id)
+        if 'robots' in current_env_state_dict and current_env_state_dict['robots'] is not None:
+            for r_data in current_env_state_dict['robots']:
+                carried_id = r_data[2]
                 if carried_id != 0:
                     current_carried_pkg_ids_set.add(carried_id)
 
-        packages_to_remove_definitively = []
-
-        # 3. Update package status
-        for pkg_id, pkg_data in list(self.persistent_packages.items()):
-            original_status_in_tracker = pkg_data['status']
-
+        packages_to_remove = []
+        for pkg_id, pkg_data in list(current_persistent_packages.items()):
             if pkg_id in current_carried_pkg_ids_set:
-                # If currently being carried by any robot in current_env_state, set to 'in_transit'
-                self.persistent_packages[pkg_id]['status'] = 'in_transit'
+                current_persistent_packages[pkg_id]['status'] = 'in_transit'
             else:
-                # Package is NOT being carried in current_env_state
-                if original_status_in_tracker == 'in_transit':
-                    # This package WAS 'in_transit' (according to our tracker)
-                    # and is now NOT carried in current_env_state.
-                    # Given the env.py logic, this means it MUST have been delivered correctly.
-                    packages_to_remove_definitively.append(pkg_id)
-                # If original_status_in_tracker was 'waiting' and it's still not carried,
-                # its status remains 'waiting'. No change needed to start_pos or status here.
-                pass
-
-        # 4. Remove packages that were successfully delivered
-        for pkg_id_to_remove in packages_to_remove_definitively:
-            if pkg_id_to_remove in self.persistent_packages:
-                del self.persistent_packages[pkg_id_to_remove]
-
-
-    def update_targets(self, tau=None):
-        if tau is None:
-            tau = self.tau
-        # Soft update
-        agent_params_src = self.agent_network.module.parameters() if self.use_data_parallel else self.agent_network.parameters()
-        agent_params_tgt = self.target_agent_network.module.parameters() if self.use_data_parallel else self.target_agent_network.parameters()
-        mixer_params_src = self.mixing_network.module.parameters() if self.use_data_parallel else self.mixing_network.parameters()
-        mixer_params_tgt = self.target_mixing_network.module.parameters() if self.use_data_parallel else self.target_mixing_network.parameters()
-
-        for target_param, param in zip(agent_params_tgt, agent_params_src):
-            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
-
-        for target_param, param in zip(mixer_params_tgt, mixer_params_src):
-            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
-
-    def save_models(self, path_prefix="qmix"):
-        # Ensure the directory exists
-        dir_name = os.path.dirname(path_prefix)
-        if dir_name and not os.path.exists(dir_name):
-            os.makedirs(dir_name)
-
-        agent_state_dict = self.agent_network.module.state_dict() if self.use_data_parallel else self.agent_network.state_dict()
-        mixer_state_dict = self.mixing_network.module.state_dict() if self.use_data_parallel else self.mixing_network.state_dict()
-
-        torch.save(agent_state_dict, f"{path_prefix}_agent.pt")
-        torch.save(mixer_state_dict, f"{path_prefix}_mixer.pt")
-        print(f"Models saved with prefix {path_prefix}")
+                if pkg_data['status'] == 'in_transit':
+                    packages_to_remove.append(pkg_id)
         
-    def load_models(self, path_prefix="qmix"):
-        agent_path = f"{path_prefix}_agent.pt"
-        mixer_path = f"{path_prefix}_mixer.pt"
+        for pkg_id_to_remove in packages_to_remove:
+            if pkg_id_to_remove in current_persistent_packages:
+                del current_persistent_packages[pkg_id_to_remove]
+        self.persistent_packages_list[env_idx] = current_persistent_packages
 
-        # Temporarily create models with default rnn_hidden_dim if loading older models
-        # or ensure saved models are compatible with current rnn_hidden_dim.
-        # For simplicity, we assume new models will be saved with rnn_hidden_dim.
-        # If loading models saved *before* RNN was added, this will error.
-        # A more robust solution would involve checking model state_dict keys.
+    def _initialize_collection_state(self, initial_reset=True):
+        """Initializes or resets the state needed for data collection."""
+        if initial_reset:
+            self.current_env_states_list = self.vec_env.reset() # List of env_state_dicts
 
-        if self.use_data_parallel:
-            self.agent_network.module.load_state_dict(torch.load(agent_path, map_location=self.device))
-            self.mixing_network.module.load_state_dict(torch.load(mixer_path, map_location=self.device))
-        else:
-            self.agent_network.load_state_dict(torch.load(agent_path, map_location=self.device))
-            self.mixing_network.load_state_dict(torch.load(mixer_path, map_location=self.device))
-        
-        # Update target networks after loading
-        if self.use_data_parallel:
-            self.target_agent_network.module.load_state_dict(self.agent_network.module.state_dict())
-            self.target_mixing_network.module.load_state_dict(self.mixing_network.module.state_dict())
-        else:
-            self.target_agent_network.load_state_dict(self.agent_network.state_dict())
-            self.target_mixing_network.load_state_dict(self.mixing_network.state_dict())
+        self.persistent_packages_list = [{} for _ in range(self.args.num_parallel_envs)]
+        for env_idx, initial_state_dict in enumerate(self.current_env_states_list):
+            self._update_persistent_packages_for_env(env_idx, initial_state_dict)
+
+        # Fix: Ensure hidden state shape is (self.n_agents, hidden_dim)
+        hidden = self.agent_net.init_hidden()
+        if hidden.dim() == 3 and hidden.shape[0] == 1:
+            hidden = hidden.squeeze(0)  # (1, 1, hidden_dim) -> (1, hidden_dim)
+        elif hidden.dim() == 2 and hidden.shape[0] == 1:
+            hidden = hidden  # (1, hidden_dim)
+        # Now expand to (self.n_agents, hidden_dim)
+        self.current_agent_hidden_states_list = [
+            hidden.expand(self.n_agents, -1).to(self.device)
+            for _ in range(self.args.num_parallel_envs)
+        ]
+
+    def update_target_networks(self, hard_update=False):
+        if hard_update:
+            self.target_agent_net.load_state_dict(self.agent_net.state_dict())
+            self.target_mixer_net.load_state_dict(self.mixer_net.state_dict())
+        else: # Soft update (Exponential Moving Average)
+            for target_param, param in zip(self.target_agent_net.parameters(), self.agent_net.parameters()):
+                target_param.data.copy_(target_param.data * (1.0 - self.args.tau) + param.data * self.args.tau)
+            for target_param, param in zip(self.target_mixer_net.parameters(), self.mixer_net.parameters()):
+                target_param.data.copy_(target_param.data * (1.0 - self.args.tau) + param.data * self.args.tau)
+
+    def _perform_update(self, batch):
+        # Renamed from train()
+        bs_eps = batch['so'].shape[0] # batch_size (number of episodes in batch)
+        T = batch['so'].shape[1]      # episode_limit (max timesteps in an episode)
+
+        # --- Move batch data to the correct device ---
+        for key in batch.keys():
+            if isinstance(batch[key], np.ndarray): # Convert numpy arrays to tensors
+                 batch[key] = torch.from_numpy(batch[key]).to(self.device, 
+                                                              dtype=torch.float32 if batch[key].dtype == np.float32 else torch.long)
+            else: # Assuming it's already a tensor, just move to device
+                 batch[key] = batch[key].to(self.device)
+
+
+        # --- Calculate Q-values for current actions using the online networks ---
+        q_agent_all_timesteps = []
+        # Initial hidden state for RNN: (bs_eps * N, rnn_hidden_dim)
+        h_agent = self.agent_net.init_hidden().expand(bs_eps * self.n_agents, -1).clone()
+
+        for t in range(T): # Iterate over timesteps in the episode
+            # Reshape observations for this timestep: (bs_eps * N, feature_dims)
+            so_t = batch['so'][:, t].reshape(bs_eps * self.n_agents, *self.args.spatial_obs_shape)
+            vo_t = batch['vo'][:, t].reshape(bs_eps * self.n_agents, self.args.vector_obs_dim)
             
-        print(f"Models loaded from prefix {path_prefix}")
-        # The old self.update_targets(tau=1.0) is implicitly handled by loading state_dict directly to targets
-        # or by re-assigning target_agent_network after loading main agent_network.
-        # Let's ensure target networks are correctly updated:
-        self.target_agent_network.load_state_dict(self.agent_network.state_dict())
-        self.target_mixing_network.load_state_dict(self.mixing_network.state_dict())
-    
-    def select_action(self, obs_numpy, agent_hidden_state, eps):
-        # obs_numpy: numpy array (C, H, W)
-        # agent_hidden_state: tensor (1, 1, rnn_hidden_dim)
-        obs_tensor = torch.from_numpy(obs_numpy).float().to(self.device)
-        # obs_tensor is (C,H,W), AgentNetwork.forward will unsqueeze to (1,C,H,W)
+            # Get Q-values and next hidden state from RNNAgent
+            q_agent_t, h_agent_next = self.agent_net(so_t, vo_t, h_agent) # q_agent_t: (bs_eps*N, n_actions)
+            q_agent_all_timesteps.append(q_agent_t)
+            h_agent = h_agent_next # Propagate hidden state
+
+        # Stack Q-values across timesteps: (T, bs_eps*N, n_actions)
+        # Permute and reshape to: (bs_eps*T*N, n_actions)
+        q_agent_current_all = torch.stack(q_agent_all_timesteps, dim=0).permute(1,0,2)
+        q_agent_current_all = q_agent_current_all.reshape(bs_eps, self.n_agents, T, self.action_dim)
+        q_agent_current_all = q_agent_current_all.permute(0,2,1,3).reshape(bs_eps*T*self.n_agents, self.action_dim)
+
+        # Get Q-values for the actions actually taken (from buffer)
+        actions_batch_u = batch['u'].reshape(bs_eps * T * self.n_agents, 1).long()
+        chosen_action_qvals = torch.gather(q_agent_current_all, dim=1, index=actions_batch_u).squeeze(1) # (bs_eps*T*N)
+        # Reshape for mixer input: (bs_eps*T, N)
+        chosen_action_qvals_for_mixer = chosen_action_qvals.reshape(bs_eps * T, self.n_agents)
+
+        # Get total Q-value from the mixer
+        global_spatial_state_batch = batch['gs'].reshape(bs_eps * T, *self.args.global_spatial_state_shape)
+        global_vector_state_batch = batch['gv'].reshape(bs_eps * T, self.args.global_vector_state_dim)
+        q_total_current = self.mixer_net(
+            chosen_action_qvals_for_mixer, global_spatial_state_batch, global_vector_state_batch
+        ) # (bs_eps*T, 1)
+
+        # --- Calculate Target Q-values using the target networks ---
+        q_target_agent_all_timesteps = []
+        h_target_agent = self.target_agent_net.init_hidden().expand(bs_eps * self.n_agents, -1).clone()
+
+        for t in range(T):
+            so_next_t = batch['so_next'][:, t].reshape(bs_eps * self.n_agents, *self.args.spatial_obs_shape)
+            vo_next_t = batch['vo_next'][:, t].reshape(bs_eps * self.n_agents, self.args.vector_obs_dim)
+            q_target_agent_t, h_target_agent_next = self.target_agent_net(so_next_t, vo_next_t, h_target_agent)
+            q_target_agent_all_timesteps.append(q_target_agent_t)
+            h_target_agent = h_target_agent_next
         
-        if np.random.rand() < eps:
-            action = np.random.randint(0, self.ACTION_DIM)
-            # For consistency, if network is called, hidden state should be updated.
-            # However, for random action, we can just pass back the same hidden state.
-            # Or, to be more rigorous, pass it through the network anyway if you want
-            # the hidden state to evolve even on random actions.
-            # For simplicity, let's assume random action doesn't require network pass for hidden state update.
-            # If network pass is desired:
-            # with torch.no_grad():
-            #    _, next_hidden_state = self.agent_network(obs_tensor, agent_hidden_state)
-            next_hidden_state = agent_hidden_state # Keep hidden state same if action is random
-        else:
-            with torch.no_grad():
-                # obs_tensor is (C,H,W). AgentNetwork.forward handles unsqueezing.
-                # agent_hidden_state is (1, 1, rnn_hidden_dim)
-                q_values, next_hidden_state = self.agent_network(obs_tensor, agent_hidden_state)
-                # q_values will be (1, action_dim)
-                action = torch.argmax(q_values.squeeze(), dim=0).item() # Squeeze to (action_dim,)
-        return action, next_hidden_state.detach() # Detach to prevent gradients flowing back during rollout
-    
-    def train_step(self, batch_size):
-        if not self.buffer.can_sample(batch_size):
-            return None
+        q_target_agent_all = torch.stack(q_target_agent_all_timesteps, dim=0).permute(1,0,2)
+        q_target_agent_all = q_target_agent_all.reshape(bs_eps, self.n_agents, T, self.action_dim)
+        q_target_agent_all = q_target_agent_all.permute(0,2,1,3).reshape(bs_eps*T*self.n_agents, self.action_dim)
 
-        batch_states, batch_next_states, batch_obs, batch_next_obs\
-        , batch_actions, batch_individual_rewards, batch_dones = \
-        self.buffer.sample(batch_size)
-
-        # batch_obs: (B, N, C, H, W)
-        # batch_actions: (B, N)
-        # batch_individual_rewards: (B, N)
-        # batch_next_obs: (B, N, C, H, W)
-        # batch_states: (B, C, H, W)
-        # batch_next_states: (B, C, H, W)
-        # batch_dones: (B, 1)
-
-        B, N_agents, C, H, W = batch_obs.shape # N_agents is NUM_AGENTS
+        # Mask unavailable actions for target Q calculation
+        next_avail_actions_batch = batch['avail_u_next'].reshape(bs_eps * T * self.n_agents, self.action_dim).bool()
+        q_target_agent_all[~next_avail_actions_batch] = -float('inf') 
         
-        # Use per-agent rewards (already shape [B, N_agents])
-        reward_tot = batch_individual_rewards  # shape: (B, N_agents)
-        dones = batch_dones.squeeze()          # shape: (B,)
+        # Select best action for target Q (max_a Q_target_a)
+        q_target_max_actions = q_target_agent_all.max(dim=1)[0] # (bs_eps*T*N)
+        q_target_max_for_mixer = q_target_max_actions.reshape(bs_eps * T, self.n_agents) # (bs_eps*T, N)
 
-        # Initialize hidden states for the batch (for RNN)
-        # Shape: (num_layers * num_directions, batch_size, rnn_hidden_dim) -> (1, B, rnn_hidden_dim)
-        initial_hidden_batch = torch.zeros(1, B, self.rnn_hidden_dim, device=self.device)
+        # Get total target Q-value from the target mixer
+        next_global_spatial_state_batch = batch['gs_next'].reshape(bs_eps * T, *self.args.global_spatial_state_shape)
+        next_global_vector_state_batch = batch['gv_next'].reshape(bs_eps * T, self.args.global_vector_state_dim)
+        q_total_target_next = self.target_mixer_net(
+            q_target_max_for_mixer, next_global_spatial_state_batch, next_global_vector_state_batch
+        ) # (bs_eps*T, 1)
 
-        # Compute individual Q-values for each agent in current observation
-        current_q_s_list = []
-        for i in range(N_agents):
-            # batch_obs[:, i] is (B, C, H, W)
-            q_values_agent_i, _ = self.agent_network(batch_obs[:, i], initial_hidden_batch) # Discard next_hidden
-            current_q_s_list.append(q_values_agent_i)
-        individual_q_values = torch.stack(current_q_s_list, dim=1)  # [B, N_agents, action_dim]
+        # --- Calculate TD Target and Loss ---
+        rewards_batch = batch['r'].reshape(bs_eps * T, 1)
+        terminated_batch = batch['terminated'].reshape(bs_eps * T, 1)
+        # y = r + gamma * Q_tot_target_next * (1 - terminated)
+        targets_td = rewards_batch + self.args.gamma * q_total_target_next * (1 - terminated_batch)
         
-        # Compute Q-values of action that agent has taken
-        chosen_q_values = torch.gather(individual_q_values, 2, batch_actions.unsqueeze(-1)).squeeze(-1) # [B, N_agents]
-
-        # Compute Q_tot for the current state
-        q_tot = self.mixing_network(chosen_q_values, batch_states)  # [B]
+        td_error = (q_total_current - targets_td.detach()) # Detach targets_td to prevent gradients from flowing into target nets
         
-        # Compute target Q-values
-        with torch.no_grad():
-            # Compute individual Q-values for next observation
-            next_q_s_list = []
-            for i in range(N_agents):
-                # batch_next_obs[:, i] is (B, C, H, W)
-                q_values_next_agent_i, _ = self.target_agent_network(batch_next_obs[:, i], initial_hidden_batch) # Discard next_hidden
-                next_q_s_list.append(q_values_next_agent_i)
-            next_individual_q_values = torch.stack(next_q_s_list, dim=1)  # [B, N_agents, action_dim]
-            
-            # Select best action for next state (Double Q-learning style for target Q selection if desired, but QMIX uses max over target Qs)
-            # For standard QMIX, we use target network for both action selection and Q-value estimation for the next state.
-            target_q_values = next_individual_q_values.max(dim=-1)[0]  # [B, N_agents]
+        # Mask out padded steps (steps beyond episode termination within the episode_limit)
+        mask = (1 - batch['padded'].reshape(bs_eps*T, 1)).float()
+        masked_td_error = td_error * mask
+        
+        # Loss: Mean Squared Error over non-padded steps
+        loss = (masked_td_error ** 2).sum() / mask.sum()
 
-            # Compute Q_tot for next state using target mixing network
-            next_q_tot = self.target_mixing_network(target_q_values, batch_next_states)  # [B]
-
-        # Compute targets
-        # Sum per-agent rewards to get the global reward for each sample
-        reward_sum = reward_tot.sum(dim=1)  # (B,)
-        target_q_tot = reward_sum + self.gamma * (1 - dones) * next_q_tot  # (BATCH_SIZE, )
-                
-        # Loss
-        loss = F.mse_loss(q_tot, target_q_tot.detach())
-
-        # Optimize
-        self.agent_optimizer.zero_grad()
-        self.mixing_optimizer.zero_grad()
+        # --- Optimization ---
+        self.optimizer.zero_grad()
         loss.backward()
-        agent_params_to_clip = self.agent_network.module.parameters() if self.use_data_parallel else self.agent_network.parameters()
-        mixer_params_to_clip = self.mixing_network.module.parameters() if self.use_data_parallel else self.mixing_network.parameters()
-        torch.nn.utils.clip_grad_norm_(agent_params_to_clip, self.gradient_clipping)
-        torch.nn.utils.clip_grad_norm_(mixer_params_to_clip, self.gradient_clipping)
-        self.agent_optimizer.step()
-        self.mixing_optimizer.step()
-
-        # Soft update target networks
-        self.update_targets(self.tau)
-
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(list(self.agent_net.parameters()) + list(self.mixer_net.parameters()), self.args.grad_norm_clip)
+        self.optimizer.step()
+        torch.cuda.empty_cache()
+        self.train_step_counter += 1
+        if self.train_step_counter % self.args.target_update_interval == 0:
+            self.update_target_networks(hard_update=self.args.hard_target_update) # Use configured update type
         return loss.item()
 
+    def run_training_steps(self):
+        """Samples from buffer and runs multiple training updates."""
+        losses = []
+        if not self.replay_buffer.can_sample():
+            return losses
 
-    def run_episode(self, eps):
-        current_state_dict = self.env.reset()
-        self.persistent_packages = {}
-        self._update_persistent_packages(current_state_dict)
+        for _ in range(self.args.num_train_steps_per_iteration):
+            if not self.replay_buffer.can_sample():
+                break # Not enough data for a full batch
+            batch_data = self.replay_buffer.sample()
+            loss = self._perform_update(batch_data)
+            losses.append(loss)
+        return losses
+
+    @torch.no_grad() # No gradients needed for action selection
+    def select_actions_epsilon_greedy(self, spatial_obs_list_np, vector_obs_list_np, 
+                                      hidden_states_list_torch, avail_actions_list_np, 
+                                      current_timestep_for_epsilon):
+        """
+        Selects actions for a batch of environments using epsilon-greedy.
+        Inputs are lists, one element per environment.
+        spatial_obs_list_np: list of [N, C, H, W] np.arrays
+        vector_obs_list_np: list of [N, D_vec] np.arrays
+        hidden_states_list_torch: list of [N, rnn_hidden_dim] torch tensors (on device)
+        avail_actions_list_np: list of [N, n_actions] boolean np.arrays
+        current_timestep_for_epsilon: global timestep for annealing epsilon.
+        Returns: 
+            chosen_actions_per_env (list of np.arrays [N] of action_indices), 
+            new_hidden_states_per_env (list of torch tensors [N, rnn_hidden_dim]),
+            epsilon (float)
+        """
+        num_active_envs = len(spatial_obs_list_np)
+        if num_active_envs == 0:
+            return [], [], 0.0 # Should not happen if called correctly
+
+        # --- Batch observations for network input ---
+        # Stack observations from all active environments:
+        # spatial_obs_tensor: (num_active_envs * N, C, H, W)
+        # vector_obs_tensor: (num_active_envs * N, D_vec)
+        # hidden_states_tensor: (num_active_envs * N, rnn_hidden_dim)
+        # avail_actions_tensor: (num_active_envs * N, n_actions)
+        spatial_obs_tensor = torch.from_numpy(np.concatenate(spatial_obs_list_np, axis=0)).float().to(self.device)
+        vector_obs_tensor = torch.from_numpy(np.concatenate(vector_obs_list_np, axis=0)).float().to(self.device)
+        hidden_states_tensor = torch.cat(hidden_states_list_torch, dim=0).to(self.device) # Already tensors
+        avail_actions_tensor = torch.from_numpy(np.concatenate(avail_actions_list_np, axis=0)).bool().to(self.device)
+
+        self.agent_net.eval() # Set to evaluation mode
+        q_values_batched, new_hidden_states_batched = self.agent_net(spatial_obs_tensor, vector_obs_tensor, hidden_states_tensor)
+        self.agent_net.train() # Back to train mode
+
+        # --- Epsilon-greedy selection ---
+        # Anneal epsilon (linear decay)
+        epsilon = self.args.epsilon_finish + (self.args.epsilon_start - self.args.epsilon_finish) * \
+                  max(0., (self.args.epsilon_anneal_time - current_timestep_for_epsilon) / self.args.epsilon_anneal_time)
+        if not self.args.use_epsilon_greedy: # If disabled, always act greedily
+            epsilon = 0.0
+
+        # Mask unavailable actions before taking argmax or random choice
+        q_values_batched_masked = q_values_batched.clone() # Avoid modifying original q_values
+        q_values_batched_masked[~avail_actions_tensor] = -float('inf')
+
+        # Greedy actions
+        greedy_actions = q_values_batched_masked.argmax(dim=1) # (num_active_envs * N)
+
+        # Random actions (must be chosen from available actions)
+        random_actions = torch.zeros_like(greedy_actions)
+        for i in range(greedy_actions.shape[0]): # Iterate over each agent in the batch
+            avail_idx_for_agent = torch.where(avail_actions_tensor[i])[0]
+            if len(avail_idx_for_agent) > 0:
+                random_actions[i] = avail_idx_for_agent[torch.randint(0, len(avail_idx_for_agent), (1,)).item()]
+            else: 
+                # This case (no available actions) should ideally be handled by the environment
+                # or by ensuring at least one action (e.g., 'stay') is always available.
+                # Fallback to the first action if no available actions.
+                random_actions[i] = 0 
+
+        # Choose based on epsilon
+        chose_random = (torch.rand(greedy_actions.shape[0], device=self.device) < epsilon)
+        chosen_actions_flat = torch.where(chose_random, random_actions, greedy_actions).cpu().numpy() # (num_active_envs * N)
+
+        # --- Reshape actions and hidden states back to per-environment lists ---
+        chosen_actions_per_env = [
+            chosen_actions_flat[i*self.n_agents : (i+1)*self.n_agents] for i in range(num_active_envs)
+        ]
         
-        # Initialize hidden states for each agent for the RNN
-        # Shape for each agent: (num_layers * num_directions, 1, rnn_hidden_dim) -> (1, 1, rnn_hidden_dim)
-        # N=1 because we process one observation at a time for this agent.
-        agent_hidden_states = [torch.zeros(1, 1, self.rnn_hidden_dim, device=self.device) for _ in range(NUM_AGENTS)]
+        new_hidden_states_batched_cpu = new_hidden_states_batched.cpu()
+        new_hidden_states_per_env = [
+            new_hidden_states_batched_cpu[i*self.n_agents : (i+1)*self.n_agents] for i in range(num_active_envs)
+        ]
         
-        done = False
-        episode_reward = 0
-        episode_loss = 0
-        step_count = 0
+        return chosen_actions_per_env, new_hidden_states_per_env, epsilon
 
-        while not done:
-            # self.env.render_pygame()
-            # Build per-agent observations
-            actions = []
-            observations_numpy = [] # Store numpy observations for buffer
-            env_actions = []
-            
-            current_agent_hidden_states_for_step = [] # To store hidden states passed to select_action
+    def collect_data_iteration(self, current_global_timestep_for_epsilon):
+        """Collects one batch of episodes from parallel environments and stores them."""
+        timesteps_collected_this_iter = 0
+        episodes_info_this_iter = [] # List of dicts {'reward': r, 'length': l}
+        epsilon_for_logging = None
 
-            for i in range(NUM_AGENTS):
-                obs_numpy = convert_observation(current_state_dict, self.persistent_packages, current_robot_idx=i)
-                observations_numpy.append(obs_numpy)
+        # Reset hidden states at the start of each new data collection round
+        hidden_init_template = self.agent_net.init_hidden() # Expected (1, rnn_hidden_dim)
+        if hidden_init_template.dim() == 3 and hidden_init_template.shape[0] == 1:
+            # This case handles if init_hidden() unexpectedly returns (1, 1, H)
+            hidden_init_template = hidden_init_template.squeeze(0) # -> (1, H)
+        elif hidden_init_template.dim() == 2 and hidden_init_template.shape[0] == 1:
+            # This is the expected case: (1, H)
+            pass # hidden_init_template is already (1, H)
+        # else: Could add a warning or error if shape is unexpected
+
+        self.current_agent_hidden_states_list = [
+            hidden_init_template.expand(self.n_agents, -1).to(self.device) # (1,H) -> (N,H)
+            for _ in range(self.args.num_parallel_envs)
+        ]
+        
+        current_episode_transitions_batch_for_buffer = [[] for _ in range(self.args.num_parallel_envs)]
+        current_episode_rewards_this_iteration = np.zeros(self.args.num_parallel_envs)
+        current_episode_lengths_this_iteration = np.zeros(self.args.num_parallel_envs, dtype=int)
+        
+        prev_env_states_list_for_transition = [s.copy() for s in self.current_env_states_list]
+        prev_persistent_packages_list_for_transition = [{k:v.copy() for k,v in p.items()} for p in self.persistent_packages_list]
+        
+        active_envs_mask = [True] * self.args.num_parallel_envs
+        
+        for t_step_in_episode in range(self.args.episode_limit):
+            if self.args.render:
+                self.vec_env.render()
+            if not any(active_envs_mask):
+                break
+
+            spatial_obs_for_net_active_envs = []
+            vector_obs_for_net_active_envs = []
+            avail_actions_for_net_active_envs = []
+            hidden_states_for_net_active_envs = []
+            env_indices_still_active_this_step = []
+
+            for env_idx in range(self.args.num_parallel_envs):
+                if not active_envs_mask[env_idx]:
+                    continue
+                env_indices_still_active_this_step.append(env_idx)
+
+                env_state_dict = self.current_env_states_list[env_idx]
+                persistent_pkgs_this_env = self.persistent_packages_list[env_idx]
                 
-                current_agent_hidden_states_for_step.append(agent_hidden_states[i]) # Store current hidden state
-                
-                # Pass numpy obs and current hidden state
-                action, next_hidden_state = self.select_action(obs_numpy, agent_hidden_states[i], eps)
-                actions.append(action)
-                agent_hidden_states[i] = next_hidden_state # Update hidden state for the next step of this agent
-            
-            # next_observations_numpy will be populated after env.step()
-            prev_state_dict = current_state_dict # Keep a reference before it's updated by env.step()
-            prev_state_numpy = convert_state(prev_state_dict, 
-                                                        self.persistent_packages,
-                                                       self.STATE_DIM)
-            
-            # Take actions and get next state
-            for int_act in actions:
-                move_idx = int_act % self.NUM_MOVE_ACTIONS
-                pkg_op_idx = int_act // self.NUM_MOVE_ACTIONS
+                spatial_obs_all_agents_this_env = []
+                vector_obs_all_agents_this_env = []
+                avail_actions_all_agents_this_env = []
 
-                # Ensure pkg_op_idx is within bounds
-                if pkg_op_idx >= self.NUM_PKG_OPS:
-                    print(f"Warning: Decoded pkg_op_idx {pkg_op_idx} is out of bounds for action {int_act}. Max is {self.NUM_PKG_OPS-1}. Defaulting to op index 0.")
-                    pkg_op_idx = 0 # Default to the first package operation (e.g., 'None')
+                for agent_id in range(self.args.n_agents):
+                    so = convert_observation(env_state_dict, persistent_pkgs_this_env, agent_id)
+                    vo = generate_vector_features(env_state_dict, persistent_pkgs_this_env, agent_id,
+                                                  self.args.max_time_steps_env, self.args.max_other_robots_to_observe,
+                                                  self.args.max_packages_to_observe)
+                    spatial_obs_all_agents_this_env.append(so)
+                    vector_obs_all_agents_this_env.append(vo)
+                    
+                    # Directly assume all actions are available based on user info and to fix AttributeError
+                    avail_ac = np.ones(self.action_dim, dtype=bool)
+                    avail_actions_all_agents_this_env.append(avail_ac)
+
+
+                spatial_obs_for_net_active_envs.append(np.stack(spatial_obs_all_agents_this_env))
+                vector_obs_for_net_active_envs.append(np.stack(vector_obs_all_agents_this_env))
+                avail_actions_for_net_active_envs.append(np.stack(avail_actions_all_agents_this_env))
+                hidden_states_for_net_active_envs.append(self.current_agent_hidden_states_list[env_idx])
+
+            if not spatial_obs_for_net_active_envs:
+                break
+
+            chosen_actions_int_list_active, next_hidden_states_list_active, current_epsilon = \
+                self.select_actions_epsilon_greedy(
+                    spatial_obs_for_net_active_envs,  
+                    vector_obs_for_net_active_envs,   
+                    hidden_states_for_net_active_envs,
+                    avail_actions_for_net_active_envs,
+                    current_global_timestep_for_epsilon 
+                )
+            if t_step_in_episode == 0: # Log epsilon once per collection iteration
+                 epsilon_for_logging = current_epsilon
+
+            env_actions_list_for_step = []
+            action_indices_for_buffer_active = [] 
+
+            for actions_for_one_active_env in chosen_actions_int_list_active:
+                env_actions_this_active_env = []
+                for agent_action_int in actions_for_one_active_env:
+                    move_idx = agent_action_int % self.args.num_move_actions
+                    pkg_op_idx = agent_action_int // self.args.num_move_actions
+                    if pkg_op_idx >= self.args.num_pkg_ops: pkg_op_idx = 0
                 
                 move_str = self.le_move.inverse_transform([move_idx])[0]
                 pkg_op_str = self.le_pkg_op.inverse_transform([pkg_op_idx])[0]
-                env_actions.append((move_str, pkg_op_str))
-                                            
-            current_state_dict, global_reward, done, _= self.env.step(env_actions)
-            self._update_persistent_packages(current_state_dict)
-            individual_rewards = reward_shaping(
-                    prev_state_dict,
-                    current_state_dict,
-                    env_actions,
-                    self.persistent_packages,
-                    NUM_AGENTS
-                )
-            current_state_numpy = convert_state(current_state_dict, 
-                                                        self.persistent_packages,
-                                                       self.STATE_DIM)
+                    env_actions_this_active_env.append((move_str, pkg_op_str))
+                env_actions_list_for_step.append(env_actions_this_active_env)
+                action_indices_for_buffer_active.append(actions_for_one_active_env)
+
+            results_list_from_step = self.vec_env.step(env_actions_list_for_step, env_indices_still_active_this_step)
             
-            # Build per-agent next observations (numpy)
-            next_observations_numpy = []
-            for i in range(NUM_AGENTS):
-                next_obs_numpy = convert_observation(current_state_dict, self.persistent_packages, current_robot_idx=i)
-                next_observations_numpy.append(next_obs_numpy)
+            # Unpack the results as four lists
+            next_env_states_list, global_rewards_list, terminated_list, infos_list = results_list_from_step
 
-            # Store in buffer (using numpy arrays for observations)
-            self.buffer.add(
-                    obs=np.array(observations_numpy), # List of (C,H,W) -> (N_agents, C,H,W)
-                    next_obs=np.array(next_observations_numpy), # List of (C,H,W) -> (N_agents, C,H,W)
-                    state=prev_state_numpy, # Name was prev_state, changed to prev_state_numpy for clarity
-                    next_state=current_state_numpy,
-                    actions=np.array(actions), # List of ints -> (N_agents,)
-                    individual_rewards=np.array(individual_rewards),
-                    done=done
+            active_env_counter_in_results = 0
+            for original_env_idx in env_indices_still_active_this_step:
+                next_env_state_dict = next_env_states_list[active_env_counter_in_results]
+                global_reward = global_rewards_list[active_env_counter_in_results]
+                terminated = terminated_list[active_env_counter_in_results]
+                info = infos_list[active_env_counter_in_results]
+                
+                actions_taken_this_env = env_actions_list_for_step[active_env_counter_in_results]
+                self._update_persistent_packages_for_env(original_env_idx, next_env_state_dict)
+
+                # Fix: Extract reward if it's a dict
+                current_episode_rewards_this_iteration[original_env_idx] += global_reward
+                current_episode_lengths_this_iteration[original_env_idx] += 1
+                timesteps_collected_this_iter += 1
+
+                so_next_all_agents_this_env = []
+                vo_next_all_agents_this_env = []
+                avail_u_next_all_agents_this_env = []
+                for agent_id in range(self.args.n_agents):
+                    so_next = convert_observation(next_env_state_dict, self.persistent_packages_list[original_env_idx], agent_id)
+                    vo_next = generate_vector_features(next_env_state_dict, self.persistent_packages_list[original_env_idx], agent_id,
+                                                       self.args.max_time_steps_env, self.args.max_other_robots_to_observe,
+                                                       self.args.max_packages_to_observe)
+                    so_next_all_agents_this_env.append(so_next)
+                    vo_next_all_agents_this_env.append(vo_next)
+                    
+                    # Directly assume all actions are available for next state as well
+                    avail_next = np.ones(self.action_dim, dtype=bool)
+                    avail_u_next_all_agents_this_env.append(avail_next)
+
+
+                gs_s_next, gs_v_next = convert_global_state(next_env_state_dict, self.persistent_packages_list[original_env_idx],
+                                                            self.args.max_time_steps_env, self.args.max_robots_in_state,
+                                                            self.args.max_packages_in_state)
+                
+                gs_s_current, gs_v_current = convert_global_state(
+                    prev_env_states_list_for_transition[original_env_idx], 
+                    prev_persistent_packages_list_for_transition[original_env_idx],
+                    self.args.max_time_steps_env, self.args.max_robots_in_state, self.args.max_packages_in_state
                 )
+                
+                current_episode_transitions_batch_for_buffer[original_env_idx].append({
+                    "so": spatial_obs_for_net_active_envs[active_env_counter_in_results],
+                    "vo": vector_obs_for_net_active_envs[active_env_counter_in_results],
+                    "gs": gs_s_current, "gv": gs_v_current,
+                    "u": action_indices_for_buffer_active[active_env_counter_in_results],
+                    "r": global_reward,
+                    "so_next": np.stack(so_next_all_agents_this_env),
+                    "vo_next": np.stack(vo_next_all_agents_this_env),
+                    "gs_next": gs_s_next, "gv_next": gs_v_next,
+                    "avail_u": avail_actions_for_net_active_envs[active_env_counter_in_results],
+                    "avail_u_next": np.stack(avail_u_next_all_agents_this_env),
+                    "terminated": terminated, "padded": False
+                })
 
-            episode_reward += global_reward
-            step_count += 1
+                self.current_env_states_list[original_env_idx] = next_env_state_dict
+                self.current_agent_hidden_states_list[original_env_idx] = next_hidden_states_list_active[active_env_counter_in_results] 
+                
+                prev_env_states_list_for_transition[original_env_idx] = next_env_state_dict.copy()
+                prev_persistent_packages_list_for_transition[original_env_idx] = {
+                    k:v.copy() for k,v in self.persistent_packages_list[original_env_idx].items()
+                }
 
-            # Training step
-            loss = self.train_step(BATCH_SIZE)
-            if loss is not None:
-                episode_loss += loss
+                if terminated:
+                    active_envs_mask[original_env_idx] = False
+                    episodes_info_this_iter.append({
+                        'reward': current_episode_rewards_this_iteration[original_env_idx],
+                        'length': current_episode_lengths_this_iteration[original_env_idx]
+                    })
+                    if len(current_episode_transitions_batch_for_buffer[original_env_idx]) > 0:
+                        self.replay_buffer.add_episode_data(current_episode_transitions_batch_for_buffer[original_env_idx])
+                active_env_counter_in_results += 1
 
+        for env_idx in range(self.args.num_parallel_envs):
+            if active_envs_mask[env_idx] and len(current_episode_transitions_batch_for_buffer[env_idx]) > 0:
+                episodes_info_this_iter.append({
+                    'reward': current_episode_rewards_this_iteration[env_idx],
+                    'length': current_episode_lengths_this_iteration[env_idx]
+                })
+                self.replay_buffer.add_episode_data(current_episode_transitions_batch_for_buffer[env_idx])
+        
+        # Prepare for the next data collection iteration by resetting environments and their persistent packages
+        # The hidden states for the next iteration will be reset at the start of the next call to this method.
+        self.current_env_states_list = self.vec_env.reset()
+        self.persistent_packages_list = [{} for _ in range(self.args.num_parallel_envs)]
+        for env_idx, state_dict in enumerate(self.current_env_states_list):
+            self._update_persistent_packages_for_env(env_idx, state_dict)
 
-        return episode_reward, episode_loss / max(1, step_count)
-    
+        return timesteps_collected_this_iter, episodes_info_this_iter, epsilon_for_logging
+
+    def save_models_learner(self, path_prefix, episode_count):
+        save_qmix_model(self.agent_net, self.mixer_net, f"{path_prefix}_ep{episode_count}")
+
+    def load_models_learner(self, path_prefix, episode_count):
+        loaded = load_qmix_model(self.agent_net, self.mixer_net, f"{path_prefix}_ep{episode_count}", device=self.device)
+        if loaded:
+            self.update_target_networks(hard_update=True) # Sync target nets after loading
+        return loaded
     
     
     
@@ -1117,86 +1373,235 @@ class QMixTrainer:
 import pygame
 
 
-trainer = QMixTrainer(env=env, use_data_parallel=True, rnn_hidden_dim=RNN_HIDDEN_DIM) # Pass RNN_HIDDEN_DIM
-if args.checkpoint_prefix:
-    print(f"Loading checkpoint from {args.checkpoint_prefix}")
-    trainer.load_models(args.checkpoint_prefix)
-    print(f"Resuming training from episode {args.start_episode}")
+args = Args() # Load hyperparameters
+print("========== QMIX CONFIGURATION ==========")
+for k, v in vars(args).items():
+    print(f"{k}: {v}")
+print("========================================")
+print(f"Using device: {device}")
+# --- Environment and Action Conversion Setup ---
+MOVE_COST = args.move_cost if hasattr(args, "move_cost") else -0.01
+DELIVERY_REWARD = args.delivery_reward if hasattr(args, "delivery_reward") else 10
+DELAY_REWARD = args.delay_reward if hasattr(args, "delay_reward") else 1
+SEED = args.seed if args.seed is not None else 42
+NUM_ENVS = args.num_parallel_envs if hasattr(args, "num_parallel_envs") else 1
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+if device.type == 'cuda':
+    torch.cuda.manual_seed_all(SEED)
 
-# Lists to store metrics for plotting
-episode_rewards_history = []
-episode_avg_loss_history = []
+# Action conversion (environment uses string actions)
+le_move = LabelEncoder()
+le_move.fit(['S', 'L', 'R', 'U', 'D']) # Stay, Left, Right, Up, Down
+le_pkg_op = LabelEncoder()
+le_pkg_op.fit(['0', '1', '2']) # 0: None, 1: Pickup, 2: Drop
+args.num_move_actions = len(le_move.classes_)
+args.num_pkg_ops = len(le_pkg_op.classes_)
+args.action_dim = args.num_move_actions * args.num_pkg_ops # Total discrete actions
 
-training_completed_successfully = False
-print("Starting QMIX training...")
-print(f"Running for {args.num_episodes} episodes, starting at episode {args.start_episode}.")
+# --- Determine Observation and State Shapes ---
+print("Initializing temporary environment to get observation/state shapes...")
+try:
+    _temp_env = Environment(
+        map_file=args.map_file,
+        n_robots=args.n_agents,
+        n_packages=args.n_packages,
+        move_cost=MOVE_COST,
+        delivery_reward=DELIVERY_REWARD,
+        delay_reward=DELAY_REWARD,
+        seed=SEED,
+        max_time_steps=args.max_time_steps_env
+    )
+    temp_env_state_dict = _temp_env.reset() # Returns dict
+    
+    # Initialize persistent packages for the temp env for shape calculation
+    temp_persistent_packages = {}
+
+    _s_obs_example = convert_observation(temp_env_state_dict, temp_persistent_packages, 0)
+    args.spatial_obs_shape = _s_obs_example.shape
+    
+    _v_obs_example = generate_vector_features(temp_env_state_dict, temp_persistent_packages, 0,
+                                                args.max_time_steps_env, args.max_other_robots_to_observe,
+                                                args.max_packages_to_observe)
+    args.vector_obs_dim = _v_obs_example.shape[0]
+
+    _gs_s_example, _gs_v_example = convert_global_state(temp_env_state_dict, temp_persistent_packages,
+                                                        args.max_time_steps_env, args.max_robots_in_state,
+                                                        args.max_packages_in_state)
+    args.global_spatial_state_shape = _gs_s_example.shape
+    args.global_vector_state_dim = _gs_v_example.shape[0]
+
+    print(f"Spatial Obs Shape: {args.spatial_obs_shape}, Vector Obs Dim: {args.vector_obs_dim}")
+    print(f"Global Spatial State Shape: {args.global_spatial_state_shape}, Global Vector State Dim: {args.global_vector_state_dim}")
+    print(f"Action Dim: {args.action_dim}, Num Agents: {args.n_agents}")
+
+except ImportError as e:
+    print(f"Could not import environment for shape determination: {e}")
+    exit()
+except Exception as e:
+    print(f"Error during temporary environment initialization or shape calculation: {e}")
+    import traceback
+    traceback.print_exc()
+    exit()
+
+# --- Initialize Learner and Replay Buffer ---
+replay_buffer = ReplayBuffer(
+    args.buffer_size, args.episode_limit, args.n_agents,
+    args.spatial_obs_shape, args.vector_obs_dim,
+    args.global_spatial_state_shape, args.global_vector_state_dim,
+    args.action_dim, 
+    args
+)
+
+# --- Vectorized Environment for Data Collection ---
+print(f"Initializing {NUM_ENVS} parallel environments...")
+try:
+    vec_env = VectorizedEnv(
+        Environment, num_envs=NUM_ENVS,
+        map_file=args.map_file,
+        n_robots=args.n_agents,
+        n_packages=args.n_packages,
+        move_cost=MOVE_COST,
+        delivery_reward=DELIVERY_REWARD,
+        delay_reward=DELAY_REWARD,
+        seed=SEED,
+        max_time_steps=args.max_time_steps_env
+    )
+except Exception as e:
+    print(f"Failed to initialize VectorizedEnv: {e}. Ensure 'env.py' and 'env_vectorized.py' are correct.")
+    exit()
+
 
 try:
-    for episode_num in range(args.start_episode, args.num_episodes + 1):
-        # The exponential_epsilon function from in[16] expects 'steps_done'
-        # Assuming 'steps_done' in that context refers to the number of episodes completed (0-indexed)
-        current_epsilon = linear_epsilon(episode_num - 1) 
-        
-        episode_reward, avg_episode_loss = trainer.run_episode(current_epsilon)
-        
-        episode_rewards_history.append(episode_reward)
-        episode_avg_loss_history.append(avg_episode_loss)
-        
-        if episode_num % 10 == 0 or episode_num == args.num_episodes: # Print every 10 episodes and the last one
-            print(f"Episode {episode_num}/{args.num_episodes} | Reward: {episode_reward:.2f} | Avg Loss: {avg_episode_loss:.4f} | Epsilon: {current_epsilon:.3f}")
+    # --- Initialize QMixLearner (New way) ---
+    qmix_trainer = QMixLearner(
+        n_agents=args.n_agents,
+        action_dim=args.action_dim,
+        args=args,
+        vec_env=vec_env,
+        replay_buffer=replay_buffer,
+        le_move=le_move,
+        le_pkg_op=le_pkg_op
+    )
 
-        # Optional: Periodic saving during training
-        if episode_num % 50 == 0: # Example: Save every 50 episodes
-            print(f"Saving checkpoint at episode {episode_num}...")
-            trainer.save_models(path_prefix=f"models/qmix_agent_ep{episode_num}")
-            trainer.save_models(path_prefix=f"models/qmix_mixer_ep{episode_num}")
+    # --- Training Loop ---
+    total_timesteps_collected = 0
+    total_episodes_collected = 0
+    episode_rewards_history = []
+    episode_lengths_history = []
+    losses_history = []
+    epsilon_history_log = [] # For logging epsilon at each action selection
+
+    # Load model if specified
+    if args.load_model_path and args.load_model_episode > 0:
+        print(f"Loading model from {args.load_model_path} at episode {args.load_model_episode}...")
+        qmix_trainer.load_models_learner(args.load_model_path, args.load_model_episode)
+
+    print(f"Starting QMIX training on {device}...")
+
+    qmix_trainer._initialize_collection_state(initial_reset=True) # Initial reset of envs and internal states
+
+    # Main training iterations (each iteration collects data and potentially trains)
+    for training_iteration in range(1, args.max_training_iterations + 1):
+        
+        # --- Data Collection Phase ---
+        # Hidden states are reset inside collect_data_iteration for the new batch of episodes
+        iter_timesteps, iter_episodes_info, iter_epsilon = \
+            qmix_trainer.collect_data_iteration(total_timesteps_collected)
+
+        total_timesteps_collected += iter_timesteps
+        for ep_info in iter_episodes_info:
+            total_episodes_collected += 1
+            episode_rewards_history.append(ep_info['reward'])
+            episode_lengths_history.append(ep_info['length'])
+        
+        if iter_epsilon is not None and training_iteration % args.log_interval == 0 :
+            epsilon_history_log.append(iter_epsilon)
+
+
+        # --- Training Phase ---
+        if qmix_trainer.replay_buffer.can_sample() and \
+        total_timesteps_collected > args.min_timesteps_to_train : # Ensure some initial exploration
             
-    training_completed_successfully = True
+            iter_losses = qmix_trainer.run_training_steps()
+            losses_history.extend(iter_losses)
 
+        # --- Logging and Saving ---
+        if training_iteration % args.log_interval == 0:
+            avg_reward = np.mean(episode_rewards_history[-args.log_interval*NUM_ENVS:]) if episode_rewards_history else 0
+            avg_length = np.mean(episode_lengths_history[-args.log_interval*NUM_ENVS:]) if episode_lengths_history else 0
+            avg_loss = np.mean(losses_history[-args.log_interval*NUM_ENVS*args.num_train_steps_per_iteration:]) if losses_history else 0 # Approx
+            last_epsilon = epsilon_history_log[-1] if epsilon_history_log else args.epsilon_start
+            
+            print(f"Iter: {training_iteration}/{args.max_training_iterations} | Total Timesteps: {total_timesteps_collected} | Total Episodes: {total_episodes_collected}")
+            print(f"  Avg Reward (last {args.log_interval*NUM_ENVS} eps): {avg_reward:.2f} | Avg Length: {avg_length:.2f}")
+            print(f"  Avg Loss (approx): {avg_loss:.4f} | Epsilon: {last_epsilon:.3f}")
+            print(f"  Buffer Size: {len(qmix_trainer.replay_buffer)}/{args.buffer_size}")
+
+        if training_iteration > 0 and training_iteration % args.save_model_interval == 0:
+            print(f"Saving model at iteration {training_iteration}, episode {total_episodes_collected}...")
+            qmix_trainer.save_models_learner(f"models/qmix_iter{training_iteration}", total_episodes_collected)
+
+        if total_timesteps_collected >= args.max_total_timesteps:
+            print(f"Reached max training timesteps: {args.max_total_timesteps}.")
+            break
 except KeyboardInterrupt:
-    print("\nTraining interrupted by user (KeyboardInterrupt).")
-    print("Saving current model state...")
-    trainer.save_models(path_prefix="models/qmix_agent_interrupted")
-    trainer.save_models(path_prefix="models/qmix_mixer_interrupted")
-    print("Models saved to _interrupted.pt files.")
+    print("\nTraining interrupted by user.")
 except Exception as e:
     print(f"\nAn error occurred during training: {e}")
     import traceback
-    traceback.print_exc() # Print detailed traceback for the exception
-    print("Saving model due to exception...")
-    trainer.save_models(path_prefix="models/qmix_agent_exception")
-    trainer.save_models(path_prefix="models/qmix_mixer_exception")
-    print("Models saved to _exception.pt files.")
+    traceback.print_exc()
 finally:
-    print("\nTraining loop finished or was interrupted.")
-    # pygame.quit()
-    
-    # Plotting the results
-    if episode_rewards_history: # Check if there's any data to plot
-        plt.figure(figsize=(14, 6))
+    pygame.quit()
+    # --- End of Training Loop ---
+    print("Training finished.")
+    qmix_trainer.save_models_learner("models/qmix_final", total_episodes_collected)
 
-        plt.subplot(1, 2, 1)
+    # --- Plotting ---
+    if not os.path.exists("plots"): os.makedirs("plots")
+    plt.figure(figsize=(18, 10))
+    plt.subplot(2, 2, 1)
+    if episode_rewards_history:
         plt.plot(episode_rewards_history)
-        plt.title('Total Reward per Episode')
+        # Moving average
+        if len(episode_rewards_history) >= 100:
+            rewards_moving_avg = np.convolve(episode_rewards_history, np.ones(100)/100, mode='valid')
+            plt.plot(np.arange(99, len(episode_rewards_history)), rewards_moving_avg, label='100-ep MA')
+            plt.legend()
+    plt.title('Episode Rewards')
         plt.xlabel('Episode')
         plt.ylabel('Total Reward')
         plt.grid(True)
 
-        plt.subplot(1, 2, 2)
-        plt.plot(episode_avg_loss_history)
-        plt.title('Average Loss per Episode')
+    plt.subplot(2, 2, 2)
+    if losses_history:
+        plt.plot(losses_history)
+    plt.title('QMIX Loss')
+    plt.xlabel('Training Step')
+    plt.ylabel('Loss')
+    plt.grid(True)
+
+    plt.subplot(2, 2, 3)
+    if episode_lengths_history:
+        plt.plot(episode_lengths_history)
+    plt.title('Episode Lengths')
         plt.xlabel('Episode')
-        plt.ylabel('Average Loss')
+    plt.ylabel('Length')
+    plt.grid(True)
+    
+    plt.subplot(2, 2, 4)
+    if epsilon_history_log: 
+        plt.plot(epsilon_history_log)
+        plt.title('Epsilon Decay')
+        plt.xlabel(f'Logged every {args.log_interval} iterations')
+        plt.ylabel('Epsilon')
         plt.grid(True)
 
         plt.tight_layout()
+    plt.savefig("plots/qmix_training_plots.png")
+    print("Training plots saved to plots/qmix_training_plots.png")
         plt.show()
-    else:
-        print("No data recorded for plotting.")
-
-if training_completed_successfully:
-    print("\nTraining completed successfully.")
-    print("Saving final model...")
-    trainer.save_models(path_prefix="models/qmix_agent_final")
-    trainer.save_models(path_prefix="models/qmix_mixer_final")
-    print("Final models saved.")
+    
+        
+        

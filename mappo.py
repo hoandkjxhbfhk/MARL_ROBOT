@@ -11,7 +11,7 @@ from sklearn.calibration import LabelEncoder # For action conversion
 import matplotlib.pyplot as plt
 
 SEED = 42
-device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 np.random.seed(SEED)
@@ -21,7 +21,7 @@ random.seed(SEED)
 # --- MAPPO Hyperparameters ---
 ACTION_DIM = 15  # Total discrete actions for an agent
 NUM_AGENTS = 5
-MAP_FILE = "map1.txt"
+MAP_FILE = "map5.txt"
 N_PACKAGES = 50
 MOVE_COST = -0.01 # Adjusted for PPO, rewards should be reasonably scaled
 DELIVERY_REWARD = 10
@@ -468,23 +468,23 @@ class CriticNetwork(nn.Module):
     
     
     
-def save_mappo_model(actor, critic, path_prefix="models_newcnn_newcnn/mappo"):
+def save_mappo_model(actor, critic, path_prefix="models_newcnn_newcnn_map5/mappo"):
     if not os.path.exists(os.path.dirname(path_prefix)):
         os.makedirs(os.path.dirname(path_prefix))
     torch.save(actor.state_dict(), f"{path_prefix}_actor.pt")
     torch.save(critic.state_dict(), f"{path_prefix}_critic.pt")
-    print(f"MAPPO models_newcnn_newcnn saved with prefix {path_prefix}")
+    print(f"MAPPO models_newcnn_newcnn_map5 saved with prefix {path_prefix}")
 
 
-def load_mappo_model(actor, critic, path_prefix="models_newcnn_newcnn/mappo", device="cpu"):
+def load_mappo_model(actor, critic, path_prefix="models_newcnn_newcnn_map5/mappo", device="cuda:2"):
     actor_path = f"{path_prefix}_actor.pt"
     critic_path = f"{path_prefix}_critic.pt"
     if os.path.exists(actor_path) and os.path.exists(critic_path):
         actor.load_state_dict(torch.load(actor_path, map_location=device))
         critic.load_state_dict(torch.load(critic_path, map_location=device))
-        print(f"MAPPO models_newcnn_newcnn loaded from prefix {path_prefix}")
+        print(f"MAPPO models_newcnn_newcnn_map5 loaded from prefix {path_prefix}")
         return True
-    print(f"Could not find MAPPO models_newcnn_newcnn at prefix {path_prefix}")
+    print(f"Could not find MAPPO models_newcnn_newcnn_map5 at prefix {path_prefix}")
     return False
 
 
@@ -968,153 +968,157 @@ class MAPPOTrainer:
     
     
     
-    
-    
-print(f"Using device: {device}")
-vec_env = VectorizedEnv(
-    Environment, num_envs=NUM_ENVS,
-    map_file=MAP_FILE,
-    n_robots=NUM_AGENTS,
-    n_packages=N_PACKAGES,
-    move_cost=MOVE_COST,
-    delivery_reward=DELIVERY_REWARD,
-    delay_reward=DELAY_REWARD,
-    seed=SEED, # Seed for each sub-environment will be SEED, SEED+1, ...
-    max_time_steps=MAX_TIME_STEPS_PER_EPISODE
-)
+if __name__ == "__main__":
+        
+    print(f"Using device: {device}")
+    vec_env = VectorizedEnv(
+        Environment, num_envs=NUM_ENVS,
+        map_file=MAP_FILE,
+        n_robots=NUM_AGENTS,
+        n_packages=N_PACKAGES,
+        move_cost=MOVE_COST,
+        delivery_reward=DELIVERY_REWARD,
+        delay_reward=DELAY_REWARD,
+        seed=SEED, # Seed for each sub-environment will be SEED, SEED+1, ...
+        max_time_steps=MAX_TIME_STEPS_PER_EPISODE
+    )
 
-# Determine observation and global state shapes from one env instance
-_temp_env = Environment(map_file=MAP_FILE, n_robots=NUM_AGENTS, n_packages=N_PACKAGES, move_cost=MOVE_COST, delivery_reward=DELIVERY_REWARD, delay_reward=DELAY_REWARD, seed=SEED, max_time_steps=MAX_TIME_STEPS_PER_EPISODE)
+    # Determine observation and global state shapes from one env instance
+    _temp_env = Environment(map_file=MAP_FILE, n_robots=NUM_AGENTS, n_packages=N_PACKAGES, move_cost=MOVE_COST, delivery_reward=DELIVERY_REWARD, delay_reward=DELAY_REWARD, seed=SEED, max_time_steps=MAX_TIME_STEPS_PER_EPISODE)
 
 
-OBS_SHAPE = (6, _temp_env.n_rows, _temp_env.n_cols)
-GLOBAL_STATE_SHAPE = (4, _temp_env.n_rows, _temp_env.n_cols)
-VECTOR_OBS_DIM = generate_vector_features(_temp_env.reset(), {}, 0, MAX_TIME_STEPS_PER_EPISODE, NUM_AGENTS-1, 5).shape[0]
-GLOBAL_VECTOR_STATE_DIM = convert_global_state(_temp_env.reset(), {}, MAX_TIME_STEPS_PER_EPISODE)[1].shape[0]
+    OBS_SHAPE = (6, _temp_env.n_rows, _temp_env.n_cols)
+    GLOBAL_STATE_SHAPE = (4, _temp_env.n_rows, _temp_env.n_cols)
+    VECTOR_OBS_DIM = generate_vector_features(_temp_env.reset(), {}, 0, MAX_TIME_STEPS_PER_EPISODE, NUM_AGENTS-1, 5).shape[0]
+    GLOBAL_VECTOR_STATE_DIM = convert_global_state(_temp_env.reset(), {}, MAX_TIME_STEPS_PER_EPISODE)[1].shape[0]
 
-print(f"Obs shape: {OBS_SHAPE}, Global state shape: {GLOBAL_STATE_SHAPE}, Vector obs dim: {VECTOR_OBS_DIM}, Global vector dim: {GLOBAL_VECTOR_STATE_DIM}")
+    print(f"Obs shape: {OBS_SHAPE}, Global state shape: {GLOBAL_STATE_SHAPE}, Vector obs dim: {VECTOR_OBS_DIM}, Global vector dim: {GLOBAL_VECTOR_STATE_DIM}")
 
-trainer = MAPPOTrainer(vec_env, NUM_AGENTS, ACTION_DIM, OBS_SHAPE, GLOBAL_STATE_SHAPE, VECTOR_OBS_DIM, GLOBAL_VECTOR_STATE_DIM)
+    trainer = MAPPOTrainer(vec_env, NUM_AGENTS, ACTION_DIM, OBS_SHAPE, GLOBAL_STATE_SHAPE, VECTOR_OBS_DIM, GLOBAL_VECTOR_STATE_DIM)
 
-# Load existing model if available
-load_mappo_model(trainer.actor, trainer.critic, device=device) # Uncomment to load
+    # Load existing model if available
+    #load_mappo_model(trainer.actor, trainer.critic, device=device) # Uncomment to load
 
-episode_rewards_history = []
-actor_loss_history = []
-critic_loss_history = []
-entropy_history = []
-rollout_reward_history = []
+    episode_rewards_history = []
+    actor_loss_history = []
+    critic_loss_history = []
+    entropy_history = []
+    rollout_reward_history = []
 
-print("Starting MAPPO training...")
+    print("Starting MAPPO training...")
 
-# Initial reset and state preparation
-current_env_states_list = vec_env.reset() # List of state dicts
-current_local_obs_list = torch.zeros((NUM_ENVS, NUM_AGENTS, *OBS_SHAPE), device="cpu")
-current_vector_obs_list = torch.zeros((NUM_ENVS, NUM_AGENTS, VECTOR_OBS_DIM), device="cpu")
-current_global_states_list = torch.zeros((NUM_ENVS, *GLOBAL_STATE_SHAPE), device="cpu")
-current_global_vector_list = torch.zeros((NUM_ENVS, GLOBAL_VECTOR_STATE_DIM), device="cpu")
+    # Initial reset and state preparation
+    current_env_states_list = vec_env.reset() # List of state dicts
+    current_local_obs_list = torch.zeros((NUM_ENVS, NUM_AGENTS, *OBS_SHAPE), device="cuda:2")
+    current_vector_obs_list = torch.zeros((NUM_ENVS, NUM_AGENTS, VECTOR_OBS_DIM), device="cuda:2")
+    current_global_states_list = torch.zeros((NUM_ENVS, *GLOBAL_STATE_SHAPE), device="cuda:2")
+    current_global_vector_list = torch.zeros((NUM_ENVS, GLOBAL_VECTOR_STATE_DIM), device="cuda:2")
 
-for env_idx in range(NUM_ENVS):
-    trainer._update_persistent_packages_for_env(env_idx, current_env_states_list[env_idx])
-    current_persistent_packages = trainer.persistent_packages_list[env_idx]
-    current_global_states_list[env_idx] = torch.from_numpy(convert_global_state(
-                                                        current_env_states_list[env_idx],
-                                                        current_persistent_packages,
-                                                        MAX_TIME_STEPS_PER_EPISODE,
-                                                        )[0]
-                                                        )
-    current_global_vector_list[env_idx] = torch.from_numpy(convert_global_state(
-                                                        current_env_states_list[env_idx],
-                                                        current_persistent_packages,
-                                                        MAX_TIME_STEPS_PER_EPISODE,
-                                                        )[1]
-                                                        )
-    for agent_idx in range(NUM_AGENTS):
-        current_local_obs_list[env_idx, agent_idx] = torch.from_numpy(
-            convert_observation(current_env_states_list[env_idx], current_persistent_packages, agent_idx)
-        ).float()
-        current_vector_obs_list[env_idx, agent_idx] = torch.from_numpy(
-            generate_vector_features(current_env_states_list[env_idx], current_persistent_packages, agent_idx,
-                                    MAX_TIME_STEPS_PER_EPISODE, NUM_AGENTS-1, 5)
-        ).float()
+    for env_idx in range(NUM_ENVS):
+        trainer._update_persistent_packages_for_env(env_idx, current_env_states_list[env_idx])
+        current_persistent_packages = trainer.persistent_packages_list[env_idx]
+        current_global_states_list[env_idx] = torch.from_numpy(convert_global_state(
+                                                            current_env_states_list[env_idx],
+                                                            current_persistent_packages,
+                                                            MAX_TIME_STEPS_PER_EPISODE,
+                                                            )[0]
+                                                            )
+        current_global_vector_list[env_idx] = torch.from_numpy(convert_global_state(
+                                                            current_env_states_list[env_idx],
+                                                            current_persistent_packages,
+                                                            MAX_TIME_STEPS_PER_EPISODE,
+                                                            )[1]
+                                                            )
+        for agent_idx in range(NUM_AGENTS):
+            current_local_obs_list[env_idx, agent_idx] = torch.from_numpy(
+                convert_observation(current_env_states_list[env_idx], current_persistent_packages, agent_idx)
+            ).float()
+            current_vector_obs_list[env_idx, agent_idx] = torch.from_numpy(
+                generate_vector_features(current_env_states_list[env_idx], current_persistent_packages, agent_idx,
+                                        MAX_TIME_STEPS_PER_EPISODE, NUM_AGENTS-1, 5)
+            ).float()
 
-num_updates = TOTAL_TIMESTEPS // (ROLLOUT_STEPS * NUM_ENVS)
-total_steps_done = 0
+    num_updates = TOTAL_TIMESTEPS // (ROLLOUT_STEPS * NUM_ENVS)
+    total_steps_done = 0
 
-try:
-    for update_num in range(1, num_updates + 1):
-        (b_obs, b_vector_obs, b_global_states, b_global_vector, b_actions, b_log_probs_old,
-            b_advantages, b_returns_critic,
-            current_env_states_list, current_local_obs_list, current_vector_obs_list, current_global_states_list, current_global_vector_list,
-            mb_rewards
-        ) = trainer.collect_rollouts(current_env_states_list, current_local_obs_list, current_vector_obs_list, current_global_states_list, current_global_vector_list)
+    try:
+        for update_num in range(1, num_updates + 1):
+            (b_obs, b_vector_obs, b_global_states, b_global_vector, b_actions, b_log_probs_old,
+                b_advantages, b_returns_critic,
+                current_env_states_list, current_local_obs_list, current_vector_obs_list, current_global_states_list, current_global_vector_list,
+                mb_rewards
+            ) = trainer.collect_rollouts(current_env_states_list, current_local_obs_list, current_vector_obs_list, current_global_states_list, current_global_vector_list)
 
-        # Track reward per rollout
-        rollout_total_reward = mb_rewards.sum().item()
-        rollout_reward_history.append(rollout_total_reward)
-        print(f"Rollout {update_num}: Total Reward = {rollout_total_reward:.2f}")
+            # Track reward per rollout
+            rollout_total_reward = mb_rewards.sum().item()
+            rollout_reward_history.append(rollout_total_reward)
+            print(f"Rollout {update_num}: Total Reward = {rollout_total_reward:.2f}")
 
-        actor_loss, critic_loss, entropy = trainer.update_ppo(
-            b_obs, b_vector_obs, b_global_states, b_global_vector, b_actions, b_log_probs_old, b_advantages, b_returns_critic
-        )
+            actor_loss, critic_loss, entropy = trainer.update_ppo(
+                b_obs, b_vector_obs, b_global_states, b_global_vector, b_actions, b_log_probs_old, b_advantages, b_returns_critic
+            )
 
-        total_steps_done += ROLLOUT_STEPS * NUM_ENVS
+            total_steps_done += ROLLOUT_STEPS * NUM_ENVS
 
-        actor_loss_history.append(actor_loss)
-        critic_loss_history.append(critic_loss)
-        entropy_history.append(entropy)
+            actor_loss_history.append(actor_loss)
+            critic_loss_history.append(critic_loss)
+            entropy_history.append(entropy)
 
-        if update_num % 10 == 0: # Log every 10 updates
-            print(f"Update {update_num}/{num_updates} | Timesteps: {total_steps_done}/{TOTAL_TIMESTEPS}")
-            print(f"  Actor Loss: {actor_loss:.4f} | Critic Loss: {critic_loss:.4f} | Entropy: {entropy:.4f}")
-            print(f"  Rollout Total Reward: {rollout_total_reward:.2f}")
+            if update_num % 10 == 0: # Log every 10 updates
+                print(f"Update {update_num}/{num_updates} | Timesteps: {total_steps_done}/{TOTAL_TIMESTEPS}")
+                print(f"  Actor Loss: {actor_loss:.4f} | Critic Loss: {critic_loss:.4f} | Entropy: {entropy:.4f}")
+                print(f"  Rollout Total Reward: {rollout_total_reward:.2f}")
 
-        if update_num % 100 == 0: # Save model periodically
-            print(f"Saving checkpoint at update {update_num}...")
-            save_mappo_model(trainer.actor, trainer.critic, path_prefix=f"models_newcnn_newcnn/mappo_update{update_num}")
+            if update_num % 100 == 0: # Save model periodically
+                print(f"Saving checkpoint at update {update_num}...")
+                save_mappo_model(trainer.actor, trainer.critic, path_prefix=f"models_newcnn_newcnn_map5/mappo_update{update_num}")
 
-except KeyboardInterrupt:
-    print("\nTraining interrupted by user.")
-except Exception as e:
-    print(f"\nAn error occurred during training: {e}")
-    import traceback
-    traceback.print_exc()
-finally:
-    print("Saving final model...")
-    save_mappo_model(trainer.actor, trainer.critic, path_prefix="models_newcnn_newcnn/mappo_final")
-    print("\nTraining loop finished or was interrupted.")
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user.")
+    except Exception as e:
+        print(f"\nAn error occurred during training: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("Saving final model...")
+        save_mappo_model(trainer.actor, trainer.critic, path_prefix="models_newcnn_newcnn_map5_map5/mappo_final")
+        print("\nTraining loop finished or was interrupted.")
 
-    # Plotting
-    plt.figure(figsize=(24, 5))
-    plt.subplot(1, 4, 1)
-    plt.plot(actor_loss_history)
-    plt.title('Actor Loss per Update')
-    plt.xlabel('Update Number')
-    plt.ylabel('Actor Loss')
-    plt.grid(True)
+        # Plotting
+        plot_dir = "plots"
+        if not os.path.exists(plot_dir):
+            os.makedirs(plot_dir)
 
-    plt.subplot(1, 4, 2)
-    plt.plot(critic_loss_history)
-    plt.title('Critic Loss per Update')
-    plt.xlabel('Update Number')
-    plt.ylabel('Critic Loss')
-    plt.grid(True)
+        plt.figure(figsize=(24, 5))
+        plt.subplot(1, 4, 1)
+        plt.plot(actor_loss_history)
+        plt.title('Actor Loss per Update')
+        plt.xlabel('Update Number')
+        plt.ylabel('Actor Loss')
+        plt.grid(True)
 
-    plt.subplot(1, 4, 3)
-    plt.plot(entropy_history)
-    plt.title('Policy Entropy per Update')
-    plt.xlabel('Update Number')
-    plt.ylabel('Entropy')
-    plt.grid(True)
+        plt.subplot(1, 4, 2)
+        plt.plot(critic_loss_history)
+        plt.title('Critic Loss per Update')
+        plt.xlabel('Update Number')
+        plt.ylabel('Critic Loss')
+        plt.grid(True)
 
-    plt.subplot(1, 4, 4)
-    plt.plot(rollout_reward_history)
-    plt.title('Total Reward per Rollout')
-    plt.xlabel('Update Number')
-    plt.ylabel('Total Reward')
-    plt.grid(True)
-    
-    plt.savefig("plots/mappo_training_plots.png")
+        plt.subplot(1, 4, 3)
+        plt.plot(entropy_history)
+        plt.title('Policy Entropy per Update')
+        plt.xlabel('Update Number')
+        plt.ylabel('Entropy')
+        plt.grid(True)
 
-    plt.tight_layout()
-    plt.show()
+        plt.subplot(1, 4, 4)
+        plt.plot(rollout_reward_history)
+        plt.title('Total Reward per Rollout')
+        plt.xlabel('Update Number')
+        plt.ylabel('Total Reward')
+        plt.grid(True)
+        
+        plt.savefig(os.path.join(plot_dir, "mappo_training_plots_map5_5agents.png"))
+
+        plt.tight_layout()
+        plt.show()

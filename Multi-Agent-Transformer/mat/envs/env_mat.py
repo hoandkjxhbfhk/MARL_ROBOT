@@ -6,7 +6,7 @@ from gym import spaces
 
 # Bảo đảm path tới thư mục gốc nằm trong sys.path để import mappo và DeliveryEnv
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
-if ROOT_DIR not in sys.path:
+if (ROOT_DIR not in sys.path):
     sys.path.append(ROOT_DIR)
 
 # Import DeliveryEnv và các hàm util đã có trong mappo
@@ -205,6 +205,9 @@ class DeliveryMATEnv(MultiAgentEnv):
     def close(self):
         pass
 
+    def get_total_delivered_packages(self):
+        return self.base_env.get_total_delivered_packages()
+
     # ------------------------------------------------------------------
     # Internal builders
     def _build_agent_obs(self, state_dict, agent_idx):
@@ -216,4 +219,4 @@ class DeliveryMATEnv(MultiAgentEnv):
 
     def _build_global_state(self, state_dict):
         g_map, g_vec = convert_global_state(state_dict, self.persistent_packages, self.max_time_steps)
-        return np.concatenate([g_map.flatten(), g_vec]).astype(np.float32) 
+        return np.concatenate([g_map.flatten(), g_vec]).astype(np.float32)

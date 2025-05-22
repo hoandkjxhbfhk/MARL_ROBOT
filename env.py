@@ -375,6 +375,8 @@ class Environment:
         for row in grid_copy:
             print('\t'.join(str(cell) for cell in row))
         
+    def get_total_delivered_packages(self):
+        return sum(1 for pkg in self.packages if pkg.status == 'delivered')
 
 if __name__=="__main__":
     env = Environment('map.txt', 10, 2, 5)
@@ -411,4 +413,3 @@ if __name__=="__main__":
         t += 1
         if t == 100:
             break
-    

@@ -114,7 +114,7 @@ class GreedyAgents:
         self.packages += [(p[0], p[1]-1, p[2]-1, p[3]-1, p[4]-1, p[5]) for p in state['packages']]
         self.packages_free += [True] * len(state['packages'])    
 
-    def get_actions(self, state):
+    def get_actions(self, state, deterministic=True):
         if self.is_init == False:
             # This mean we have invoke the init agents, use the update_inner_state to update the state
             self.is_init = True

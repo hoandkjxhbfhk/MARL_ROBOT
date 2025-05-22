@@ -84,16 +84,19 @@ def main(args):
 
     # device
     if all_args.cuda and torch.cuda.is_available():
-        device = torch.device("cuda:0")
+        device = torch.device("cuda:3")
         torch.set_num_threads(all_args.n_training_threads)
     else:
         device = torch.device("cpu")
         torch.set_num_threads(all_args.n_training_threads)
 
+    # Tạo tên thư mục con dựa trên cấu hình map
+    map_config_name = f"{os.path.splitext(os.path.basename(all_args.map_file))[0]}_{all_args.n_agents}agents_{all_args.n_packages}pkgs"
+
     run_dir = Path(
         os.path.split(os.path.dirname(os.path.abspath(__file__)))[0]
         + "/results"
-    ) / all_args.env_name / all_args.algorithm_name / all_args.experiment_name
+    ) / all_args.env_name / all_args.algorithm_name / map_config_name / all_args.experiment_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # choose run id

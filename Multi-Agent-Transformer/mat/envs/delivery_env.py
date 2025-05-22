@@ -122,4 +122,8 @@ class DeliveryEnv(gym.Env):
         return obs_n, reward_n, done_n, info_n
 
     def render(self, mode='human'):
-        return self.base_env.render() 
+        return self.base_env.render()
+
+    def get_total_delivered_packages(self):
+        # Count packages with status 'delivered'
+        return sum(1 for pkg in self.base_env.packages if pkg.status == 'delivered')
